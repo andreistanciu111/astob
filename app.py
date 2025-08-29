@@ -47,7 +47,7 @@ async def generate(
             with open(clients_zip_path, "wb") as f:
                 f.write(await clients_zip.read())
         else:
-            packaged = Path("static") / "CLIENTI_TOTAL_PESTE_0_ONE_ROW_HEADERS_SINGLE_DETAILS_TOTAL_TOP.zip"
+            packaged = Path("static") / "Ordine_Plata_ Astob.zip"
             if packaged.exists():
                 clients_zip_path = packaged
 
