@@ -65,12 +65,27 @@ async def generate(
         if clients_zip_path:
             cmd += ["--clients-zip", str(clients_zip_path)]
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            return JSONResponse({"ok": False, "error": "Generator failed", "stderr": proc.stderr}, status_code=500)
+       proc = subprocess.run(cmd, capture_output=True, text=True)
+if proc.returncode != 0:
+    return JSONResponse({
+        "ok": False,
+        "error": "Generator failed",
+        "stderr": proc.stderr,
+        "stdout": proc.stdout,
+        "cmd": cmd
+    }, status_code=500)
 
-        if not out_zip.exists():
-            return JSONResponse({"ok": False, "error": "ZIP not produced"}, status_code=500)
+if not out_zip.exists():
+    from pathlib import Path
+    listing = [str(p.relative_to(tmpdir)) for p in Path(tmpdir).rglob('*')]
+    return JSONResponse({
+        "ok": False,
+        "error": "ZIP not produced",
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "cmd": cmd,
+        "tmp_listing": listing
+    }, status_code=500)
 
         def iterfile():
             with open(out_zip, "rb") as f:
