@@ -24,15 +24,17 @@ async def generate(
 ):
     tmpdir = Path(tempfile.mkdtemp(prefix="astobgen_"))
     try:
-        # 1) Salvează upload-urile
-        astob_path = tmpdir / "astob.xlsx"
-        key_path = tmpdir / "key.xlsx"
+        # 1) Salvează fișierele cu extensia originală
+        astob_name = Path(astob.filename or "astob.xlsx")
+        key_name   = Path(key.filename or "key.xlsx")
+        astob_path = tmpdir / f"astob{(astob_name.suffix or '.xlsx')}"
+        key_path   = tmpdir / f"key{(key_name.suffix or '.xlsx')}"
         with open(astob_path, "wb") as f:
             f.write(await astob.read())
         with open(key_path, "wb") as f:
             f.write(await key.read())
 
-        # 2) Template: din upload sau din ./static/bp model cu {}.xlsx
+        # 2) Template: upload sau din ./static/bp model cu {}.xlsx
         if template is not None:
             template_path = tmpdir / "template.xlsx"
             with open(template_path, "wb") as f:
@@ -45,7 +47,7 @@ async def generate(
                     status_code=400
                 )
 
-        # 3) clients_zip opțional (din upload sau din ./static/… dacă există)
+        # 3) clients_zip opțional
         clients_zip_path = None
         if clients_zip is not None:
             clients_zip_path = tmpdir / "clients.zip"
@@ -103,7 +105,7 @@ async def generate(
                         break
                     yield chunk
 
-        headers = {"Content-Disposition": 'attachment; filename="ordine.zip"'}
+        headers = {"Content-Disposition": 'attachment; filename=\"ordine.zip\"'}
         return StreamingResponse(iterfile(out_zip), media_type="application/zip", headers=headers)
 
     finally:
