@@ -14,32 +14,57 @@ def norm(s):
     s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
     return s.lower()
 
-def read_table(path: Path) -> pd.DataFrame:
-    """Citește .xlsx/.xls/.csv, cu fallback-uri utile."""
-    ext = path.suffix.lower()
+def sniff_type(path: Path) -> str:
+    # Detectează după „magic bytes”: xlsx (zip PK), xls (CFB), altfel csv/other
     try:
-        if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-            return pd.read_excel(path, engine="openpyxl")
-        if ext == ".xls":
-            return pd.read_excel(path, engine="xlrd")
-        if ext == ".csv":
-            # autodetect separator
-            return pd.read_csv(path, sep=None, engine="python")
-        # fallback 1: încearcă openpyxl
-        return pd.read_excel(path, engine="openpyxl")
+        with open(path, "rb") as f:
+            sig = f.read(8)
+        if sig.startswith(b"PK"):  # Office Open XML zip
+            return "xlsx"
+        if sig.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):  # OLE CFBF => .xls
+            return "xls"
     except Exception:
-        # fallback 2: încearcă CSV generic
+        pass
+    return "other"
+
+def read_table(path: Path) -> pd.DataFrame:
+    """Citește fișierul pe baza conținutului, cu fallback-uri utile."""
+    kind = sniff_type(path)
+    # încercări ordonate
+    trials = []
+    if kind == "xlsx":
+        trials = [("excel-openpyxl", dict(fn=pd.read_excel, kw=dict(engine="openpyxl")))]
+    elif kind == "xls":
+        trials = [("excel-xlrd", dict(fn=pd.read_excel, kw=dict(engine="xlrd")))]
+    else:
+        # necunoscut: încercăm întâi openpyxl (poate e xlsx valid), apoi xlrd, apoi CSV cu encodings
+        trials = [
+            ("excel-openpyxl", dict(fn=pd.read_excel, kw=dict(engine="openpyxl"))),
+            ("excel-xlrd",     dict(fn=pd.read_excel, kw=dict(engine="xlrd"))),
+            ("csv-auto",       dict(fn=pd.read_csv,   kw=dict(sep=None, engine="python"))),
+            ("csv-utf8",       dict(fn=pd.read_csv,   kw=dict(encoding="utf-8", sep=None, engine="python"))),
+            ("csv-latin1",     dict(fn=pd.read_csv,   kw=dict(encoding="latin-1", sep=None, engine="python"))),
+            ("csv-win1250",    dict(fn=pd.read_csv,   kw=dict(encoding="windows-1250", sep=None, engine="python"))),
+            ("csv-win1252",    dict(fn=pd.read_csv,   kw=dict(encoding="windows-1252", sep=None, engine="python"))),
+        ]
+    errors = []
+    for tag, spec in trials:
         try:
-            return pd.read_csv(path, sep=None, engine="python")
-        except Exception as e2:
-            raise
+            df = spec["fn"](path, **spec["kw"])
+            print(f"[read_table] {path.name}: ok via {tag}")
+            return df
+        except Exception as e:
+            errors.append(f"{tag}: {e.__class__.__name__}: {e}")
+    raise ValueError(f"Cannot read table {path.name}. Tried: " + " | ".join(errors))
 
 def find_col(df, candidates):
     cols = {norm(c): c for c in df.columns}
+    # exact
     for cand in candidates:
         key = norm(cand)
         if key in cols:
             return cols[key]
+    # contains
     for cand in candidates:
         key = norm(cand)
         for k, v in cols.items():
@@ -117,16 +142,19 @@ def main():
     out_zip = Path(args.out_zip)
     ensure_dir(out_dir)
 
-    # 1) Citește tabelele
+    print(f"[debug] astob={astob_path.name}, key={key_path.name}")
+    print(f"[debug] sniff astob={sniff_type(astob_path)}, sniff key={sniff_type(key_path)}")
+
+    # 1) Citește tabelele (robust)
     astob = read_table(astob_path)
     key   = read_table(key_path)
 
-    # 2) Mapează coloane (robust la variații/diacritice)
+    # 2) Coloane (robust la variații/diacritice)
     col_tid_key   = find_col(key, ["TID"])
     col_bmc       = find_col(key, ["BMC"])
     col_clientkey = find_col(key, [
-        "DENUMIRE SOCIETATEAGENT", "DENUMIRE SOCIETATE AGENT",
-        "Denumire Societate Agent", "Denumire Societate/Agent", "Client"
+        "DENUMIRE SOCIETATEAGENT","DENUMIRE SOCIETATE AGENT",
+        "Denumire Societate Agent","Denumire Societate/Agent","Client"
     ])
     col_tid_astob = find_col(astob, ["Nr. terminal","nr terminal","terminal","TID"])
     col_prod      = find_col(astob, ["Nume Operator","Operator","Denumire Produs"])
@@ -229,3 +257,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
