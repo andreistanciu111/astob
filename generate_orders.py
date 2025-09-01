@@ -14,6 +14,18 @@ def norm(s):
     s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
     return s.lower()
 
+def read_table(path: Path) -> pd.DataFrame:
+    """Citește robust .xlsx/.xlsm/.csv și dă eroare clară pe .xls."""
+    ext = path.suffix.lower()
+    if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+        return pd.read_excel(path, engine="openpyxl")
+    if ext == ".csv":
+        return pd.read_csv(path)
+    if ext == ".xls":
+        raise ValueError("Fișier .xls detectat. Te rog trimite .xlsx (sau instalează xlrd<2 și setează engine='xlrd').")
+    # fallback: încearcă openpyxl
+    return pd.read_excel(path, engine="openpyxl")
+
 def find_col(df, candidates):
     cols = {norm(c): c for c in df.columns}
     # exact
@@ -57,12 +69,15 @@ def unmerge_all(ws):
             ws.unmerge_cells(str(r))
 
 def copy_style(src, dst):
-    if src.has_style:
-        dst.font = src.font.copy()
-        dst.fill = src.fill.copy()
-        dst.border = src.border.copy()
-        dst.alignment = src.alignment.copy()
-        dst.number_format = src.number_format
+    if getattr(src, "has_style", False):
+        try:
+            dst.font = src.font.copy()
+            dst.fill = src.fill.copy()
+            dst.border = src.border.copy()
+            dst.alignment = src.alignment.copy()
+            dst.number_format = src.number_format
+        except Exception:
+            pass
 
 def replace_total(ws, total_value):
     pattern = re.compile(r"\{?\s*total\s*\}?", re.I)
@@ -97,10 +112,10 @@ def main():
     ensure_dir(out_dir)
 
     # 1) Citește Excel-urile
-    astob = pd.read_excel(astob_path)
-    key = pd.read_excel(key_path)
+    astob = read_table(astob_path)
+    key   = read_table(key_path)
 
-    # 2) Coloane (robust, cu diacritice/variații)
+    # 2) Coloane (robust la variații/diacritice)
     # din TABEL CHEIE:
     col_tid_key   = find_col(key, ["TID"])
     col_bmc       = find_col(key, ["BMC"])
@@ -148,9 +163,9 @@ def main():
     # 7) Creează fișiere per CLIENT (din KEY)
     created_files = []
     for client, g in df.groupby("Client", dropna=True):
-        client_str = "" if pd.isna(client) else str(client)
+        client_str = "" if pd.isna(client) else str(client).strip()
         total = float(g["Valoare cu TVA"].sum())
-        if total <= 0 or not client_str.strip():
+        if total <= 0 or not client_str:
             continue
 
         wb = load_workbook(template_path)
