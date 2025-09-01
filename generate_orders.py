@@ -15,25 +15,31 @@ def norm(s):
     return s.lower()
 
 def read_table(path: Path) -> pd.DataFrame:
-    """Citește robust .xlsx/.xlsm/.csv și dă eroare clară pe .xls."""
+    """Citește .xlsx/.xls/.csv, cu fallback-uri utile."""
     ext = path.suffix.lower()
-    if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+    try:
+        if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+            return pd.read_excel(path, engine="openpyxl")
+        if ext == ".xls":
+            return pd.read_excel(path, engine="xlrd")
+        if ext == ".csv":
+            # autodetect separator
+            return pd.read_csv(path, sep=None, engine="python")
+        # fallback 1: încearcă openpyxl
         return pd.read_excel(path, engine="openpyxl")
-    if ext == ".csv":
-        return pd.read_csv(path)
-    if ext == ".xls":
-        raise ValueError("Fișier .xls detectat. Te rog trimite .xlsx (sau instalează xlrd<2 și setează engine='xlrd').")
-    # fallback: încearcă openpyxl
-    return pd.read_excel(path, engine="openpyxl")
+    except Exception:
+        # fallback 2: încearcă CSV generic
+        try:
+            return pd.read_csv(path, sep=None, engine="python")
+        except Exception as e2:
+            raise
 
 def find_col(df, candidates):
     cols = {norm(c): c for c in df.columns}
-    # exact
     for cand in candidates:
         key = norm(cand)
         if key in cols:
             return cols[key]
-    # contains
     for cand in candidates:
         key = norm(cand)
         for k, v in cols.items():
@@ -111,19 +117,17 @@ def main():
     out_zip = Path(args.out_zip)
     ensure_dir(out_dir)
 
-    # 1) Citește Excel-urile
+    # 1) Citește tabelele
     astob = read_table(astob_path)
     key   = read_table(key_path)
 
-    # 2) Coloane (robust la variații/diacritice)
-    # din TABEL CHEIE:
+    # 2) Mapează coloane (robust la variații/diacritice)
     col_tid_key   = find_col(key, ["TID"])
     col_bmc       = find_col(key, ["BMC"])
     col_clientkey = find_col(key, [
         "DENUMIRE SOCIETATEAGENT", "DENUMIRE SOCIETATE AGENT",
         "Denumire Societate Agent", "Denumire Societate/Agent", "Client"
     ])
-    # din ASTOB:
     col_tid_astob = find_col(astob, ["Nr. terminal","nr terminal","terminal","TID"])
     col_prod      = find_col(astob, ["Nume Operator","Operator","Denumire Produs"])
     col_sum       = find_col(astob, ["Sumă tranzacție","Suma tranzactie","Valoare cu TVA","Valoare"])
@@ -140,13 +144,13 @@ def main():
         col_time:"Ora",
     }, inplace=True)
     astob2["Valoare cu TVA"] = pd.to_numeric(astob2["Valoare cu TVA"], errors="coerce").fillna(0.0)
-    astob2 = astob2[astob2["Valoare cu TVA"] > 0]  # doar tranzacții > 0
+    astob2 = astob2[astob2["Valoare cu TVA"] > 0]
 
-    # 4) Normalizează KEY (TID, BMC, Client din KEY)
+    # 4) Normalizează KEY
     key2 = key[[col_tid_key, col_bmc, col_clientkey]].copy()
     key2.columns = ["TID","BMC","Client"]
 
-    # 5) Join pe TID (Client și BMC din KEY)
+    # 5) Join pe TID
     df = astob2.merge(key2, on="TID", how="left")
 
     # 6) Datetime text
@@ -160,7 +164,7 @@ def main():
     if not df.empty:
         df["Data Tranzactiei"] = df.apply(fmt_dt, axis=1)
 
-    # 7) Creează fișiere per CLIENT (din KEY)
+    # 7) Creează fișiere per CLIENT
     created_files = []
     for client, g in df.groupby("Client", dropna=True):
         client_str = "" if pd.isna(client) else str(client).strip()
@@ -170,19 +174,15 @@ def main():
 
         wb = load_workbook(template_path)
         ws = wb.active
-
-        # fără merged cells + rând 2 = 25.20 (~42 px)
         unmerge_all(ws)
         try:
             ws.row_dimensions[2].height = 25.20
         except Exception:
             pass
 
-        # găsește rândul-model și maparea coloanelor
         model_row, colmap = find_model_row(ws)
         model_cells = {c: ws.cell(model_row, c) for c in colmap.values()}
 
-        # pregătește rândurile
         rows = []
         for _, r in g.iterrows():
             rows.append({
@@ -193,7 +193,6 @@ def main():
                 "data tranzactiei": r.get("Data Tranzactiei",""),
             })
 
-        # inserează rânduri (N-1)
         if len(rows) > 1:
             ws.insert_rows(model_row+1, amount=len(rows)-1)
 
@@ -201,16 +200,13 @@ def main():
         for i, rowdata in enumerate(rows):
             r = model_row + i
             for token, col in colmap.items():
-                val = rowdata[token]  # chei: exact ca în tokens (lower)
                 cell = ws.cell(r, col)
-                cell.value = val
+                cell.value = rowdata[token]
                 copy_style(model_cells[col], cell)
                 cell.font = txn_font
 
-        # {TOTAL}
         replace_total(ws, total)
 
-        # Placeholder-e header (best-effort)
         placeholders = {"{NUME}": client_str, "{CLIENT}": client_str}
         for r in range(1, ws.max_row+1):
             for c in range(1, ws.max_column+1):
@@ -222,17 +218,14 @@ def main():
                     if nv != v:
                         ws.cell(r,c).value = nv
 
-        # salvează
         safe_client = re.sub(r'[\\/*?:"<>|]+', "_", client_str).strip() or "Client"
         out_path = out_dir / f"Ordin - {safe_client}.xlsx"
         wb.save(out_path)
         created_files.append(out_path)
 
-    # 8) Arhivează (creează zip chiar dacă nu sunt fișiere)
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in created_files:
             zf.write(p, p.name)
 
 if __name__ == "__main__":
     main()
-
