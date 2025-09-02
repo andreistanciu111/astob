@@ -18,9 +18,9 @@ def sniff_type(path: Path) -> str:
     try:
         with open(path, "rb") as f:
             sig = f.read(8)
-        if sig.startswith(b"PK"):  # .xlsx (zip)
+        if sig.startswith(b"PK"):  # .xlsx
             return "xlsx"
-        if sig.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):  # .xls (OLE)
+        if sig.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):  # .xls
             return "xls"
     except Exception:
         pass
@@ -122,7 +122,6 @@ def replace_total(ws, total_value):
                     ws.cell(r,c).value = pattern.sub(f"{total_value:,.2f}".replace(",", ""), v)
 
 def replace_placeholders(ws, mapping: dict):
-    # înlocuiește {CHEIE} oriunde apare (case-insensitive, permite și diacritice)
     for r in range(1, ws.max_row+1):
         for c in range(1, ws.max_column+1):
             v = ws.cell(r,c).value
@@ -130,14 +129,12 @@ def replace_placeholders(ws, mapping: dict):
                 continue
             new_v = v
             for key, val in mapping.items():
-                # acceptă si variante cu/ fără punctuație/diacritice ex: {NR. INREGISTRARE R.C.}
                 pat = re.compile(r"\{\s*"+re.escape(key)+r"\s*\}", re.I)
                 new_v = pat.sub("" if val is None else str(val), new_v)
             if new_v != v:
                 ws.cell(r,c).value = new_v
 
 def clear_leftover_token_rows(ws, start_row, search_rows=10):
-    # dacă mai există un rând cu {DENUMIRE SITE}/{TID}/... după tabel, îl curățăm
     token_re = re.compile(r"\{\s*(denumire site|tid|denumire produs|valoare cu tva|data tranzactiei)\s*\}", re.I)
     for r in range(start_row, min(ws.max_row, start_row+search_rows)+1):
         has_token = False
@@ -148,8 +145,7 @@ def clear_leftover_token_rows(ws, start_row, search_rows=10):
                 break
         if has_token:
             for c in range(1, ws.max_column+1):
-                ws.cell(r,c).value = None  # golim rândul
-    return
+                ws.cell(r,c).value = None
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
@@ -162,7 +158,7 @@ def main():
     ap.add_argument("--template", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--out-zip", required=True)
-    ap.add_argument("--clients-zip", required=False)  # rezervat
+    ap.add_argument("--clients-zip", required=False)
     args = ap.parse_args()
 
     astob_path = Path(args.astob)
@@ -195,7 +191,15 @@ def main():
     # 2b) coloane opționale pentru antet
     col_cui    = opt_col(key, ["CUI","CIF"])
     col_adresa = opt_col(key, ["Adresa","Sediu central","Sediul central"])
-    col_rc     = opt_col(key, ["Nr. înregistrare R.C.","Nr. inregistrare R.C.","Nr. Reg. Com.","Nr Reg Com"])
+    col_rc     = opt_col(key, [
+        # generice
+        "Nr. Inregistrare","Nr Inregistrare","Nr. înregistrare","Numar inregistrare","Număr înregistrare",
+        # RC
+        "Nr. înregistrare R.C.","Nr. inregistrare R.C.","Nr. Reg. Com.","Nr Reg Com",
+        # RV
+        "Nr. înregistrare R.V.","Nr. inregistrare R.V.","Nr. înregistrare RV","Nr inregistrare RV",
+        "NR INREGISTRARE R.V.","NR INREGISTRARE RV","NR INREG RV","NR RV","R.V.","RV"
+    ])
 
     # 3) normalizează ASTOB
     astob2 = astob.copy()
@@ -244,16 +248,15 @@ def main():
         ws = wb.active
         unmerge_all(ws)
         try:
-            ws.row_dimensions[2].height = 25.20  # cerința ta pentru rândul 2
+            ws.row_dimensions[2].height = 25.20  # rândul 2 fix
         except Exception:
             pass
 
         model_row, colmap = find_model_row(ws)
         model_cells = {c: ws.cell(model_row, c) for c in colmap.values()}
-        # memorăm înălțimea rândului model
         model_height = ws.row_dimensions[model_row].height or 15
 
-        # pregătim rândurile de scris
+        # pregătim rânduri tranzacții
         rows = []
         for _, r in g.iterrows():
             rows.append({
@@ -264,11 +267,9 @@ def main():
                 "data tranzactiei": r.get("Data Tranzactiei",""),
             })
 
-        # inserăm rânduri dacă e cazul
         if len(rows) > 1:
             ws.insert_rows(model_row+1, amount=len(rows)-1)
 
-        # stil + valori pe fiecare rând; forțăm înălțime egală
         txn_font = Font(name="Calibri", size=14, bold=True)
         for i, rowdata in enumerate(rows):
             ridx = model_row + i
@@ -279,11 +280,8 @@ def main():
                 copy_style(model_cells[col], cell)
                 cell.font = txn_font
 
-        # înlocuim TOTAL
         replace_total(ws, total)
 
-        # completăm antetul (și golim dacă nu avem valoare)
-        # luăm info client din key (primul non-null din grup)
         def first_notna(series, default=""):
             try:
                 s = series.dropna()
@@ -291,21 +289,31 @@ def main():
             except Exception:
                 return default
 
+        # mapping antet (acoperă Nr. Inregistrare / RC / RV)
         mapping = {
             "NUME": client_str,
             "CLIENT": client_str,
             "CUI": first_notna(g.get("CUI",""), ""),
             "ADRESA": first_notna(g.get("ADRESA",""), ""),
+            # generice
+            "NR. INREGISTRARE": first_notna(g.get("NR_RC",""), ""),
+            "NR INREGISTRARE":  first_notna(g.get("NR_RC",""), ""),
+            # RC
             "NR. INREGISTRARE R.C.": first_notna(g.get("NR_RC",""), ""),
-            "NR INREGISTRARE R.C.": first_notna(g.get("NR_RC",""), ""),
-            "NR INREGISTRARE RC": first_notna(g.get("NR_RC",""), ""),
+            "NR INREGISTRARE R.C.":  first_notna(g.get("NR_RC",""), ""),
+            "NR INREGISTRARE RC":    first_notna(g.get("NR_RC",""), ""),
+            # RV
+            "NR. INREGISTRARE R.V.": first_notna(g.get("NR_RC",""), ""),
+            "NR INREGISTRARE R.V.":  first_notna(g.get("NR_RC",""), ""),
+            "NR. INREGISTRARE RV":   first_notna(g.get("NR_RC",""), ""),
+            "NR INREGISTRARE RV":    first_notna(g.get("NR_RC",""), ""),
+            "NR INREG RV":           first_notna(g.get("NR_RC",""), ""),
+            "NR RV":                 first_notna(g.get("NR_RC",""), ""),
         }
         replace_placeholders(ws, mapping)
 
-        # curățăm eventuale rânduri rămase cu token-urile tabelului
         clear_leftover_token_rows(ws, start_row=model_row+len(rows))
 
-        # salvează
         safe_client = re.sub(r'[\\/*?:"<>|]+', "_", client_str).strip() or "Client"
         out_path = out_dir / f"Ordin - {safe_client}.xlsx"
         wb.save(out_path)
