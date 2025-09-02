@@ -6,7 +6,7 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 
-# ---------- Helpers ----------
+# ---------- utilitare ----------
 def norm(s):
     if s is None: return ""
     if not isinstance(s, str): s = str(s)
@@ -15,29 +15,25 @@ def norm(s):
     return s.lower()
 
 def sniff_type(path: Path) -> str:
-    # Detectează după „magic bytes”: xlsx (zip PK), xls (CFB), altfel csv/other
     try:
         with open(path, "rb") as f:
             sig = f.read(8)
-        if sig.startswith(b"PK"):  # Office Open XML zip
+        if sig.startswith(b"PK"):  # .xlsx (zip)
             return "xlsx"
-        if sig.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):  # OLE CFBF => .xls
+        if sig.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"):  # .xls (OLE)
             return "xls"
     except Exception:
         pass
     return "other"
 
 def read_table(path: Path) -> pd.DataFrame:
-    """Citește fișierul pe baza conținutului, cu fallback-uri utile."""
     kind = sniff_type(path)
-    # încercări ordonate
     trials = []
     if kind == "xlsx":
         trials = [("excel-openpyxl", dict(fn=pd.read_excel, kw=dict(engine="openpyxl")))]
     elif kind == "xls":
         trials = [("excel-xlrd", dict(fn=pd.read_excel, kw=dict(engine="xlrd")))]
     else:
-        # necunoscut: încercăm întâi openpyxl (poate e xlsx valid), apoi xlrd, apoi CSV cu encodings
         trials = [
             ("excel-openpyxl", dict(fn=pd.read_excel, kw=dict(engine="openpyxl"))),
             ("excel-xlrd",     dict(fn=pd.read_excel, kw=dict(engine="xlrd"))),
@@ -59,12 +55,10 @@ def read_table(path: Path) -> pd.DataFrame:
 
 def find_col(df, candidates):
     cols = {norm(c): c for c in df.columns}
-    # exact
     for cand in candidates:
         key = norm(cand)
         if key in cols:
             return cols[key]
-    # contains
     for cand in candidates:
         key = norm(cand)
         for k, v in cols.items():
@@ -72,8 +66,14 @@ def find_col(df, candidates):
                 return v
     raise KeyError(f"Missing columns: tried {candidates} in {list(df.columns)}")
 
+def opt_col(df, candidates):
+    try:
+        return find_col(df, candidates)
+    except Exception:
+        return None
+
+TOKENS_TABLE = ["denumire site","tid","denumire produs","valoare cu tva","data tranzactiei"]
 def find_model_row(ws):
-    tokens = ["denumire site","tid","denumire produs","valoare cu tva","data tranzactiei"]
     def clean(v):
         s = norm(v)
         s = s.replace("{","").replace("}","")
@@ -82,13 +82,13 @@ def find_model_row(ws):
         found = set()
         for c in range(1, ws.max_column+1):
             s = clean(ws.cell(r,c).value)
-            for t in tokens:
+            for t in TOKENS_TABLE:
                 if t in s: found.add(t)
-        if len(found)==len(tokens):
+        if len(found)==len(TOKENS_TABLE):
             colmap = {}
             for c in range(1, ws.max_column+1):
                 s = clean(ws.cell(r,c).value)
-                for t in tokens:
+                for t in TOKENS_TABLE:
                     if t in s and t not in colmap:
                         colmap[t]=c
             return r, colmap
@@ -121,10 +121,40 @@ def replace_total(ws, total_value):
                 else:
                     ws.cell(r,c).value = pattern.sub(f"{total_value:,.2f}".replace(",", ""), v)
 
+def replace_placeholders(ws, mapping: dict):
+    # înlocuiește {CHEIE} oriunde apare (case-insensitive, permite și diacritice)
+    for r in range(1, ws.max_row+1):
+        for c in range(1, ws.max_column+1):
+            v = ws.cell(r,c).value
+            if not isinstance(v, str):
+                continue
+            new_v = v
+            for key, val in mapping.items():
+                # acceptă si variante cu/ fără punctuație/diacritice ex: {NR. INREGISTRARE R.C.}
+                pat = re.compile(r"\{\s*"+re.escape(key)+r"\s*\}", re.I)
+                new_v = pat.sub("" if val is None else str(val), new_v)
+            if new_v != v:
+                ws.cell(r,c).value = new_v
+
+def clear_leftover_token_rows(ws, start_row, search_rows=10):
+    # dacă mai există un rând cu {DENUMIRE SITE}/{TID}/... după tabel, îl curățăm
+    token_re = re.compile(r"\{\s*(denumire site|tid|denumire produs|valoare cu tva|data tranzactiei)\s*\}", re.I)
+    for r in range(start_row, min(ws.max_row, start_row+search_rows)+1):
+        has_token = False
+        for c in range(1, ws.max_column+1):
+            v = ws.cell(r,c).value
+            if isinstance(v, str) and token_re.search(v):
+                has_token = True
+                break
+        if has_token:
+            for c in range(1, ws.max_column+1):
+                ws.cell(r,c).value = None  # golim rândul
+    return
+
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-# ---------- Main ----------
+# ---------- MAIN ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--astob", required=True)
@@ -132,7 +162,7 @@ def main():
     ap.add_argument("--template", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--out-zip", required=True)
-    ap.add_argument("--clients-zip", required=False)
+    ap.add_argument("--clients-zip", required=False)  # rezervat
     args = ap.parse_args()
 
     astob_path = Path(args.astob)
@@ -145,11 +175,11 @@ def main():
     print(f"[debug] astob={astob_path.name}, key={key_path.name}")
     print(f"[debug] sniff astob={sniff_type(astob_path)}, sniff key={sniff_type(key_path)}")
 
-    # 1) Citește tabelele (robust)
+    # 1) tabele
     astob = read_table(astob_path)
     key   = read_table(key_path)
 
-    # 2) Coloane (robust la variații/diacritice)
+    # 2) coloane obligatorii
     col_tid_key   = find_col(key, ["TID"])
     col_bmc       = find_col(key, ["BMC"])
     col_clientkey = find_col(key, [
@@ -162,7 +192,12 @@ def main():
     col_date      = find_col(astob, ["Data tranzacției","Data tranzactiei","Data"])
     col_time      = find_col(astob, ["Ora tranzacției","Ora tranzactiei","Ora"])
 
-    # 3) Normalizează ASTOB
+    # 2b) coloane opționale pentru antet
+    col_cui    = opt_col(key, ["CUI","CIF"])
+    col_adresa = opt_col(key, ["Adresa","Sediu central","Sediul central"])
+    col_rc     = opt_col(key, ["Nr. înregistrare R.C.","Nr. inregistrare R.C.","Nr. Reg. Com.","Nr Reg Com"])
+
+    # 3) normalizează ASTOB
     astob2 = astob.copy()
     astob2.rename(columns={
         col_tid_astob:"TID",
@@ -174,14 +209,19 @@ def main():
     astob2["Valoare cu TVA"] = pd.to_numeric(astob2["Valoare cu TVA"], errors="coerce").fillna(0.0)
     astob2 = astob2[astob2["Valoare cu TVA"] > 0]
 
-    # 4) Normalizează KEY
-    key2 = key[[col_tid_key, col_bmc, col_clientkey]].copy()
-    key2.columns = ["TID","BMC","Client"]
+    # 4) normalizează KEY + extra info
+    cols = [col_tid_key, col_bmc, col_clientkey]
+    new_names = ["TID","BMC","Client"]
+    if col_cui:    cols.append(col_cui);    new_names.append("CUI")
+    if col_adresa: cols.append(col_adresa); new_names.append("ADRESA")
+    if col_rc:     cols.append(col_rc);     new_names.append("NR_RC")
+    key2 = key[cols].copy()
+    key2.columns = new_names
 
-    # 5) Join pe TID
+    # 5) join pe TID
     df = astob2.merge(key2, on="TID", how="left")
 
-    # 6) Datetime text
+    # 6) text dată+oră
     def fmt_dt(row):
         d, t = row.get("Data"), row.get("Ora")
         try:  dtxt = pd.to_datetime(d).strftime("%Y-%m-%d")
@@ -192,7 +232,7 @@ def main():
     if not df.empty:
         df["Data Tranzactiei"] = df.apply(fmt_dt, axis=1)
 
-    # 7) Creează fișiere per CLIENT
+    # 7) fișiere per client
     created_files = []
     for client, g in df.groupby("Client", dropna=True):
         client_str = "" if pd.isna(client) else str(client).strip()
@@ -204,13 +244,16 @@ def main():
         ws = wb.active
         unmerge_all(ws)
         try:
-            ws.row_dimensions[2].height = 25.20
+            ws.row_dimensions[2].height = 25.20  # cerința ta pentru rândul 2
         except Exception:
             pass
 
         model_row, colmap = find_model_row(ws)
         model_cells = {c: ws.cell(model_row, c) for c in colmap.values()}
+        # memorăm înălțimea rândului model
+        model_height = ws.row_dimensions[model_row].height or 15
 
+        # pregătim rândurile de scris
         rows = []
         for _, r in g.iterrows():
             rows.append({
@@ -221,40 +264,57 @@ def main():
                 "data tranzactiei": r.get("Data Tranzactiei",""),
             })
 
+        # inserăm rânduri dacă e cazul
         if len(rows) > 1:
             ws.insert_rows(model_row+1, amount=len(rows)-1)
 
+        # stil + valori pe fiecare rând; forțăm înălțime egală
         txn_font = Font(name="Calibri", size=14, bold=True)
         for i, rowdata in enumerate(rows):
-            r = model_row + i
+            ridx = model_row + i
+            ws.row_dimensions[ridx].height = model_height
             for token, col in colmap.items():
-                cell = ws.cell(r, col)
+                cell = ws.cell(ridx, col)
                 cell.value = rowdata[token]
                 copy_style(model_cells[col], cell)
                 cell.font = txn_font
 
+        # înlocuim TOTAL
         replace_total(ws, total)
 
-        placeholders = {"{NUME}": client_str, "{CLIENT}": client_str}
-        for r in range(1, ws.max_row+1):
-            for c in range(1, ws.max_column+1):
-                v = ws.cell(r,c).value
-                if isinstance(v, str):
-                    nv = v
-                    for k, vv in placeholders.items():
-                        nv = nv.replace(k, vv)
-                    if nv != v:
-                        ws.cell(r,c).value = nv
+        # completăm antetul (și golim dacă nu avem valoare)
+        # luăm info client din key (primul non-null din grup)
+        def first_notna(series, default=""):
+            try:
+                s = series.dropna()
+                return str(s.iloc[0]) if len(s) else default
+            except Exception:
+                return default
 
+        mapping = {
+            "NUME": client_str,
+            "CLIENT": client_str,
+            "CUI": first_notna(g.get("CUI",""), ""),
+            "ADRESA": first_notna(g.get("ADRESA",""), ""),
+            "NR. INREGISTRARE R.C.": first_notna(g.get("NR_RC",""), ""),
+            "NR INREGISTRARE R.C.": first_notna(g.get("NR_RC",""), ""),
+            "NR INREGISTRARE RC": first_notna(g.get("NR_RC",""), ""),
+        }
+        replace_placeholders(ws, mapping)
+
+        # curățăm eventuale rânduri rămase cu token-urile tabelului
+        clear_leftover_token_rows(ws, start_row=model_row+len(rows))
+
+        # salvează
         safe_client = re.sub(r'[\\/*?:"<>|]+', "_", client_str).strip() or "Client"
         out_path = out_dir / f"Ordin - {safe_client}.xlsx"
         wb.save(out_path)
         created_files.append(out_path)
 
+    # zip
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in created_files:
             zf.write(p, p.name)
 
 if __name__ == "__main__":
     main()
-
