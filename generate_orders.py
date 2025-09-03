@@ -91,15 +91,32 @@ def copy_style(src, dst):
             pass
 
 def replace_total(ws, total_value):
-    pattern = re.compile(r"\{?\s*total\s*\}?", re.I)
+    """
+    Înlocuiește DOAR {TOTAL} cu suma și pune eticheta 'Total' în coloana A
+    pe același rând, Calibri 14 Bold. Nu atinge etichetele fără acolade.
+    """
+    pat = re.compile(r"\{\s*total\s*\}", re.I)
+    num_txt = f"{total_value:,.2f}".replace(",", "")
+
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             v = ws.cell(r, c).value
-            if isinstance(v, str) and pattern.search(v):
-                if pattern.fullmatch(v.strip()):
+            if isinstance(v, str) and pat.search(v):
+                # scrie suma în celula cu {TOTAL}
+                if pat.fullmatch(v.strip()):
                     ws.cell(r, c).value = float(total_value)
                 else:
-                    ws.cell(r, c).value = pattern.sub(f"{total_value:,.2f}".replace(",", ""), v)
+                    ws.cell(r, c).value = pat.sub(num_txt, v)
+
+                # eticheta "Total" în col A a aceluiași rând
+                left = ws.cell(r, 1)
+                if not isinstance(left.value, str) or not re.search(r"\btotal\b", str(left.value), re.I):
+                    left.value = "Total"
+                    try:
+                        left.font = Font(name="Calibri", size=14, bold=True)
+                    except Exception:
+                        pass
+                return  # terminăm după prima potrivire
 
 def replace_placeholders(ws, mapping: dict):
     for r in range(1, ws.max_row + 1):
@@ -294,7 +311,7 @@ def main():
                 copy_style(model_cells[col], cell)
                 cell.font = txn_font
 
-        # TOTAL
+        # TOTAL (sumă + eticheta în col. A)
         replace_total(ws, total)
 
         # Antet client (umple și variantele RC/RV/Nr. Inregistrare)
