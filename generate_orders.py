@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import argparse, re, zipfile, unicodedata
 from pathlib import Path
+from datetime import timedelta
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font
@@ -16,12 +17,10 @@ def norm(s):
 
 def sniff_type(path: Path) -> str:
     try:
-        with open(path, "rb") as f:
-            sig = f.read(8)
+        sig = path.read_bytes()[:8]
         if sig.startswith(b"PK"): return "xlsx"
         if sig.startswith(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"): return "xls"
-    except Exception:
-        pass
+    except Exception: pass
     return "other"
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -74,26 +73,20 @@ def unmerge_all(ws):
 def copy_style(src, dst):
     if getattr(src, "has_style", False):
         try:
-            dst.font = src.font.copy()
-            dst.fill = src.fill.copy()
-            dst.border = src.border.copy()
-            dst.alignment = src.alignment.copy()
+            dst.font = src.font.copy(); dst.fill = src.fill.copy()
+            dst.border = src.border.copy(); dst.alignment = src.alignment.copy()
             dst.number_format = src.number_format
-        except Exception:
-            pass
+        except Exception: pass
 
 def replace_total(ws, total_value):
-    """Doar {TOTAL} -> suma; eticheta 'Total' în coloana A, Calibri 14 Bold."""
+    """Doar {TOTAL} -> sumă; pune 'Total' în col. A pe același rând (Calibri 14 Bold)."""
     pat = re.compile(r"\{\s*total\s*\}", re.I)
     num_txt = f"{total_value:,.2f}".replace(",", "")
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             v = ws.cell(r, c).value
             if isinstance(v, str) and pat.search(v):
-                if pat.fullmatch(v.strip()):
-                    ws.cell(r, c).value = float(total_value)
-                else:
-                    ws.cell(r, c).value = pat.sub(num_txt, v)
+                ws.cell(r, c).value = float(total_value) if pat.fullmatch(v.strip()) else pat.sub(num_txt, v)
                 left = ws.cell(r, 1)
                 if not isinstance(left.value, str) or not re.search(r"\btotal\b", str(left.value), re.I):
                     left.value = "Total"
@@ -108,8 +101,7 @@ def replace_placeholders(ws, mapping: dict):
             if not isinstance(v, str): continue
             new_v = v
             for key, val in mapping.items():
-                pat = re.compile(r"\{\s*"+re.escape(key)+r"\s*\}", re.I)
-                new_v = pat.sub("" if val is None else str(val), new_v)
+                new_v = new_v.replace(key, val)
             if new_v != v:
                 ws.cell(r,c).value = new_v
 
@@ -125,7 +117,6 @@ TOKEN_PAT = {
     "valoare cu tva":  re.compile(r"\{\s*valoare\s*cu\s*tva\s*\}", re.I),
     "data tranzactiei":re.compile(r"\{\s*data\s*tranzactiei\s*\}", re.I),
 }
-
 def find_model_row(ws):
     for r in range(1, ws.max_row+1):
         hits = {}
@@ -143,14 +134,16 @@ def clear_leftover_token_rows(ws, start_row, search_rows=10):
     token_re = re.compile(r"\{\s*(denumire\s*site|tid|denumire\s*produs|valoare\s*cu\s*tva|data\s*tranzactiei)\s*\}", re.I)
     last = min(ws.max_row, start_row + search_rows)
     for r in range(start_row, last+1):
-        has_token = False
-        for c in range(1, ws.max_column+1):
-            v = ws.cell(r,c).value
-            if isinstance(v, str) and token_re.search(v):
-                has_token = True; break
+        has_token = any(isinstance(ws.cell(r,c).value, str) and token_re.search(ws.cell(r,c).value)
+                        for c in range(1, ws.max_column+1))
         if has_token:
             for c in range(1, ws.max_column+1):
                 ws.cell(r,c).value = None
+
+def ro_month_upper(d) -> str:
+    luni = ["IANUARIE","FEBRUARIE","MARTIE","APRILIE","MAI","IUNIE",
+            "IULIE","AUGUST","SEPTEMBRIE","OCTOMBRIE","NOIEMBRIE","DECEMBRIE"]
+    return f"{d.day} {luni[d.month-1]} {d.year}"
 
 # =============== MAIN ===============
 def main():
@@ -187,10 +180,8 @@ def main():
     col_tid_astob = find_col(astob, ["Nr. terminal","nr terminal","terminal","TID"])
     col_prod      = find_col(astob, ["Nume Operator","Operator","Denumire Produs"])
     col_sum       = find_col(astob, ["Sumă tranzacție","Suma tranzactie","Valoare cu TVA","Valoare"])
-
-    # ==== Dată/Ora: 'Ora' e opțională; uneori e combinată în 'Data tranzacției' ====
     col_date      = find_col(astob, ["Data tranzacției","Data tranzactiei","Data"])
-    col_time      = opt_col(astob, ["Ora tranzacției","Ora tranzactiei","Ora"])  # opțională!
+    col_time      = opt_col(astob, ["Ora tranzacției","Ora tranzactiei","Ora"])  # opțional
 
     # 3) Normalizează ASTOB
     astob2 = astob.copy()
@@ -209,12 +200,10 @@ def main():
     # === Datetime + sort (dată + oră) robust, dayfirst ===
     d = pd.to_datetime(astob2["Data"], errors="coerce", dayfirst=True, infer_datetime_format=True)
     if "Ora" in astob2.columns:
-        # ex. "14:05" sau "14:05:33"
         t = pd.to_timedelta(astob2["Ora"].astype(str).str.strip().str.replace(".", ":", regex=False), errors="coerce")
         base = d.fillna(pd.Timestamp(1970,1,1))
         dt = base + t.fillna(pd.Timedelta(0))
     else:
-        # Ora e deja în Data (sau lipsește); folosim doar d
         dt = d
     astob2["DT_SORT"] = dt
 
@@ -222,9 +211,7 @@ def main():
     def fmt_dt(row):
         if pd.notna(row["DT_SORT"]):
             return row["DT_SORT"].strftime("%Y-%m-%d %H:%M:%S")
-        # fallback pe valorile brute
         return str(row.get("Data", "")).strip()
-
     astob2["Data Tranzactiei"] = astob2.apply(fmt_dt, axis=1)
 
     # 4) Normalizează KEY + info antet
@@ -254,7 +241,7 @@ def main():
         total = float(g["Valoare cu TVA"].sum())
         if total <= 0 or not client_str: continue
 
-        # sortare dată+oră (crescător, stabil)
+        # sortare dată+oră (crescător)
         g = g.sort_values("DT_SORT", kind="mergesort")
 
         wb = load_workbook(template_path)
@@ -290,8 +277,10 @@ def main():
                 copy_style(model_cells[col], cell)
                 cell.font = txn_font
 
+        # TOTAL
         replace_total(ws, total)
 
+        # Antet client
         def first_notna(series, default=""):
             try:
                 s = series.dropna()
@@ -303,6 +292,7 @@ def main():
             "NUME": client_str, "CLIENT": client_str,
             "CUI": first_notna(g.get("CUI",""), ""),
             "ADRESA": first_notna(g.get("ADRESA",""), ""),
+            # Nr. Inregistrare / RC / RV
             "NR. INREGISTRARE": first_notna(g.get("NR_RC",""), ""),
             "NR INREGISTRARE":  first_notna(g.get("NR_RC",""), ""),
             "NR. INREGISTRARE R.C.": first_notna(g.get("NR_RC",""), ""),
@@ -316,6 +306,17 @@ def main():
             "NR RV":                 first_notna(g.get("NR_RC",""), ""),
         }
         replace_placeholders(ws, mapping)
+
+        # === COLECTARI & HEADER_DATE ===
+        dmin_dt = g["DT_SORT"].min()
+        dmax_dt = g["DT_SORT"].max()
+        colectari_str = f"Colectari - {dmin_dt:%d.%m.%Y} - {dmax_dt:%d.%m.%Y}"
+        header_date = dmax_dt.date() + timedelta(days=1)    # ziua următoare după ultima tranzacție
+        header_str  = ro_month_upper(header_date)
+        replace_placeholders(ws, {
+            "{COLECTARI}": colectari_str,
+            "{HEADER_DATE}": header_str,
+        })
 
         clear_leftover_token_rows(ws, start_row=model_row+len(rows))
 
