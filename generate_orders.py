@@ -4,15 +4,24 @@ from io import BytesIO
 from datetime import datetime, date
 from typing import Dict, List, Tuple
 from copy import copy
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from unidecode import unidecode
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 
 # ---------------- utils ----------------
 RO_MONTHS = {1:"IANUARIE",2:"FEBRUARIE",3:"MARTIE",4:"APRILIE",5:"MAI",6:"IUNIE",7:"IULIE",8:"AUGUST",9:"SEPTEMBRIE",10:"OCTOMBRIE",11:"NOIEMBRIE",12:"DECEMBRIE"}
+
 def today_ro(d: date | None = None) -> str:
-    d = d or date.today(); return f"{d.day} {RO_MONTHS[d.month]} {d.year}"
+    d = d or date.today()
+    return f"{d.day} {RO_MONTHS[d.month]} {d.year}"
+
+def today_ro_bucharest() -> str:
+    # data curentă în Europe/Bucharest
+    now = datetime.now(ZoneInfo("Europe/Bucharest")).date()
+    return today_ro(now)
 
 def norm(s: str) -> str:
     s = unidecode(str(s)).lower().replace("\u00A0"," ")
@@ -117,7 +126,8 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
     # ASTOB
     col_tid_ast  = find_col(ast, ["Nr. terminal","TID"])
     col_sum_ast  = find_col(ast, ["Sumă tranzacție","Suma tranzactie","Valoare cu TVA"])
-    col_prod_ast = find_col(ast, ["Nume Comerciant","Comerciant","Denumire Produs"])
+    # denumire produs = prefer Nume Operator (cerința ta)
+    col_prod_ast = find_col(ast, ["Nume Operator","Nume operator","Operator","Denumire Produs","Nume Comerciant","Comerciant"])
     col_date_ast = find_col(ast, ["Data tranzacției","Data tranzactiei","Data"])
     try:
         col_time_ast = find_col(ast, ["Ora tranzacției","Ora tranzactiei","Ora"])
@@ -145,7 +155,7 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
     key["_TID"]  = key[col_tid_key].astype(str).str.replace(r"\.0$","",regex=True).str.strip()
     key["_NAME"] = key[col_name_key].astype(str).str.strip()
     key["_RC"]   = key[col_rc_key].astype(str).str.strip()
-    key["_CUI"]  = key[col_cui_key].astype(str).str.strip()   # <- FIX
+    key["_CUI"]  = key[col_cui_key].astype(str).str.strip()
     key["_ADR"]  = key[col_addr_key].astype(str).str.strip()
     key["_SITE"] = key[col_site_key].astype(str).str.strip()
 
@@ -168,7 +178,7 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
         rows_by_client.setdefault(info["client"], []).append((
             info["site"],           # DENUMIRE SITE din BMC
             r["_TID"],
-            r["_PROD"],
+            r["_PROD"],             # <- acum e Nume Operator prioritar
             float(r["_VAL"] or 0.0),
             r["_DT"],
         ))
@@ -207,7 +217,7 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
             wb = load_workbook(template_path); ws = wb.active
 
             replace_all(ws, {
-                "{HEADER_DATE}": today_ro(),
+                "{HEADER_DATE}": today_ro_bucharest(),  # <- data de azi în RO
                 "{COLECTARI}": colectari,
                 "{NUME}": client,
                 "{NR. INREGISTRARE R.C.}": info.get("rc",""),
@@ -226,17 +236,32 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
             for idx, (site, tid, prod, val, dt) in enumerate(items):
                 if idx > 0: ws.insert_rows(r)
                 apply_row(ws, r, data_styles, data_height)
+
                 ws.cell(r, c_site.column, value=site)
                 ws.cell(r, c_tid.column,  value=tid)
                 ws.cell(r, c_prod.column, value=prod)
-                vcell = ws.cell(r, c_val.column, value=float(val)); vcell.number_format = "0,00"
-                dcell = ws.cell(r, c_dat.column, value=dt);         dcell.number_format = "yyyy-mm-dd hh:mm:ss"
+
+                # valoare numerică, fără zero-padding
+                vcell = ws.cell(r, c_val.column, value=None)
+                vcell.number_format = "General"      # curăță orice format moștenit
+                vcell.value = round(float(val), 2)   # numeric
+                vcell.number_format = "0,00"         # format RO
+                vcell.alignment = Alignment(horizontal="right", vertical="center")
+
+                dcell = ws.cell(r, c_dat.column, value=dt)
+                dcell.number_format = "yyyy-mm-dd hh:mm:ss"
+
                 r += 1
 
             # total – pe rândul placeholder {TOTAL} mutat după inserări
             tot_row = c_tot.row + (len(items)-1)
             apply_row(ws, tot_row, total_styles, total_height)
-            ws.cell(tot_row, c_tot.column, value=float(total_client)).number_format = "0,00"
+
+            tcell = ws.cell(tot_row, c_tot.column, value=None)
+            tcell.number_format = "General"
+            tcell.value = round(float(total_client), 2)
+            tcell.number_format = "0,00"
+            tcell.alignment = Alignment(horizontal="right", vertical="center")
 
             bio = BytesIO(); wb.save(bio); bio.seek(0)
             zf.writestr(f"Ordin - {safe_name(client)}.xlsx", bio.read())
