@@ -2,6 +2,7 @@ pandas==2.2.3
 openpyxl==3.1.5
 numpy==1.26.4
 python-dateutil==2.9.0.post0
+
 fastapi==0.112.2
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
