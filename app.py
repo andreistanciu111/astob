@@ -22,7 +22,7 @@ def generate_b64(p: B64Payload):
     try:
         astob_bytes = b64decode(p.astob_b64)
         key_bytes   = b64decode(p.key_b64)
-        zip_bytes   = generate_zip_from_bytes(astob_bytes, key_bytes, p.template_path)
+        zip_bytes   = generate_zip_from_bytes(astob_bytes, key_bytes, p.template_path or "static/bp model cu {} - date.xlsx")
         return JSONResponse({
             "ok": True,
             "filename": "ordine.zip",
@@ -30,5 +30,4 @@ def generate_b64(p: B64Payload):
             "zip_b64": b64encode(zip_bytes).decode("utf-8"),
         })
     except Exception as e:
-        # dăm mesaj util în JSON (n8n -> Response Format: JSON)
         return JSONResponse({"ok": False, "error": "Generator failed", "details": str(e)}, status_code=500)
