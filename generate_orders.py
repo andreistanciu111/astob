@@ -1,4 +1,3 @@
-# generate_orders.py
 from __future__ import annotations
 import zipfile, re
 from io import BytesIO
@@ -146,7 +145,7 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
     key["_TID"]  = key[col_tid_key].astype(str).str.replace(r"\.0$","",regex=True).str.strip()
     key["_NAME"] = key[col_name_key].astype(str).str.strip()
     key["_RC"]   = key[col_rc_key].astype(str).str.strip()
-    key["_CUI"]  = key[col_cui_key].astype str if False else key[col_cui_key].astype(str).str.strip()  # keep explicit cast
+    key["_CUI"]  = key[col_cui_key].astype(str).str.strip()   # <- FIX
     key["_ADR"]  = key[col_addr_key].astype(str).str.strip()
     key["_SITE"] = key[col_site_key].astype(str).str.strip()
 
@@ -203,7 +202,6 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
             colectari = f"Colectari - {dmin:%d.%m.%Y} - {dmax:%d.%m.%Y}"
 
             any_tid = items[0][1]
-            # extrage info client
             info = tid2info.get(any_tid, {"rc":"","cui":"","adr":""})
 
             wb = load_workbook(template_path); ws = wb.active
