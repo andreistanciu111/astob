@@ -4,11 +4,11 @@ import zipfile, re
 from io import BytesIO
 from datetime import datetime, date
 from typing import Dict, List, Tuple
+from copy import copy
 
 import pandas as pd
 from unidecode import unidecode
 from openpyxl import load_workbook
-from openpyxl.styles import Font, Alignment
 
 # ---------------- utils ----------------
 RO_MONTHS = {1:"IANUARIE",2:"FEBRUARIE",3:"MARTIE",4:"APRILIE",5:"MAI",6:"IUNIE",7:"IULIE",8:"AUGUST",9:"SEPTEMBRIE",10:"OCTOMBRIE",11:"NOIEMBRIE",12:"DECEMBRIE"}
@@ -76,15 +76,27 @@ def first_cell(ws, needle: str):
 
 def snapshot_row(ws, row_idx: int):
     styles = {}; height = ws.row_dimensions[row_idx].height
-    for col in range(1, ws.max_column+1):
+    for col in range(1, ws.max_column + 1):
         cell = ws.cell(row=row_idx, column=col)
-        styles[col] = (cell.font, cell.border, cell.fill, cell.number_format, cell.protection, cell.alignment)
+        styles[col] = {
+            "font":    copy(cell.font),
+            "border":  copy(cell.border),
+            "fill":    copy(cell.fill),
+            "numfmt":  cell.number_format,
+            "protect": copy(cell.protection),
+            "align":   copy(cell.alignment),
+        }
     return styles, height
 
 def apply_row(ws, row_idx: int, styles, height):
     for col, st in styles.items():
         c = ws.cell(row=row_idx, column=col)
-        c.font, c.border, c.fill, c.number_format, c.protection, c.alignment = st
+        c.font          = copy(st["font"])
+        c.border        = copy(st["border"])
+        c.fill          = copy(st["fill"])
+        c.number_format = st["numfmt"]
+        c.protection    = copy(st["protect"])
+        c.alignment     = copy(st["align"])
     if height is not None:
         ws.row_dimensions[row_idx].height = height
 
@@ -134,12 +146,15 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
     key["_TID"]  = key[col_tid_key].astype(str).str.replace(r"\.0$","",regex=True).str.strip()
     key["_NAME"] = key[col_name_key].astype(str).str.strip()
     key["_RC"]   = key[col_rc_key].astype(str).str.strip()
-    key["_CUI"]  = key[col_cui_key].astype(str).str.strip()
+    key["_CUI"]  = key[col_cui_key].astype str if False else key[col_cui_key].astype(str).str.strip()  # keep explicit cast
     key["_ADR"]  = key[col_addr_key].astype(str).str.strip()
     key["_SITE"] = key[col_site_key].astype(str).str.strip()
 
     # map TID -> info (site din cheie BMC)
-    tid2info = { r["_TID"]: {"client": r["_NAME"], "rc": r["_RC"], "cui": r["_CUI"], "adr": r["_ADR"], "site": r["_SITE"]} for _,r in key.iterrows() }
+    tid2info = {
+        r["_TID"]: {"client": r["_NAME"], "rc": r["_RC"], "cui": r["_CUI"], "adr": r["_ADR"], "site": r["_SITE"]}
+        for _,r in key.iterrows()
+    }
 
     # păstrăm doar tranzacții cu TID recunoscut
     ast = ast[ast["_TID"].isin(tid2info.keys())].copy()
@@ -161,7 +176,6 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
 
     # template
     wb0 = load_workbook(template_path); ws0 = wb0.active
-    # găsește pozițiile placeholder-elor din tabel
     c_site = first_cell(ws0, "{DENUMIRE SITE}")
     c_tid  = first_cell(ws0, "{TID}")
     c_prod = first_cell(ws0, "{DENUMIRE PRODUS}")
@@ -177,7 +191,6 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
     out_zip = BytesIO()
     with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for client, items in rows_by_client.items():
-            # scoate sume ≤ 0, sortează după dată+oră
             items = [t for t in items if t[3] > 0.0]
             if not items: continue
             items.sort(key=lambda x: x[4])
@@ -189,13 +202,12 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
             dmax = max(dt.date() for *_, dt in items)
             colectari = f"Colectari - {dmin:%d.%m.%Y} - {dmax:%d.%m.%Y}"
 
-            # info static client (din primul TID)
             any_tid = items[0][1]
+            # extrage info client
             info = tid2info.get(any_tid, {"rc":"","cui":"","adr":""})
 
             wb = load_workbook(template_path); ws = wb.active
 
-            # înlocuiri antet + capete, să nu rămână acolade
             replace_all(ws, {
                 "{HEADER_DATE}": today_ro(),
                 "{COLECTARI}": colectari,
@@ -211,7 +223,7 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
                 "{TOTAL}": "Total",
             })
 
-            # scriere rânduri tranzacții cu stilul rândului-model
+            # scriere rânduri cu stilul rândului-model
             r = row_model
             for idx, (site, tid, prod, val, dt) in enumerate(items):
                 if idx > 0: ws.insert_rows(r)
@@ -219,8 +231,8 @@ def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path:
                 ws.cell(r, c_site.column, value=site)
                 ws.cell(r, c_tid.column,  value=tid)
                 ws.cell(r, c_prod.column, value=prod)
-                c = ws.cell(r, c_val.column, value=float(val)); c.number_format = "0,00"
-                dcell = ws.cell(r, c_dat.column, value=dt); dcell.number_format = "yyyy-mm-dd hh:mm:ss"
+                vcell = ws.cell(r, c_val.column, value=float(val)); vcell.number_format = "0,00"
+                dcell = ws.cell(r, c_dat.column, value=dt);         dcell.number_format = "yyyy-mm-dd hh:mm:ss"
                 r += 1
 
             # total – pe rândul placeholder {TOTAL} mutat după inserări
