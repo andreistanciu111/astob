@@ -1,331 +1,299 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import argparse
 import io
 import os
 import re
-import sys
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, date
+import unicodedata
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
 
-# ----------------------------- util -----------------------------
 
-MONTH_RO = [
-    "IANUARIE", "FEBRUARIE", "MARTIE", "APRILIE", "MAI", "IUNIE",
-    "IULIE", "AUGUST", "SEPTEMBRIE", "OCTOMBRIE", "NOIEMBRIE", "DECEMBRIE"
-]
-
-def format_header_date(dt):
-    return f"{dt.day} {MONTH_RO[dt.month-1]} {dt.year}"
-
-def strip_diacritics(s: str) -> str:
-    rep = {
-        "ă": "a", "â": "a", "î": "i", "ş": "s", "ș": "s", "ţ": "t", "ț": "t",
-        "Ă": "A", "Â": "A", "Î": "I", "Ş": "S", "Ș": "S", "Ţ": "T", "Ț": "T",
-        "ó": "o", "Ó": "O", "é": "e", "É": "E", "á": "a", "Á": "A",
-        "í": "i", "Í": "I", "ú": "u", "Ú": "U", "è": "e", "È": "E"
-    }
-    return "".join(rep.get(ch, ch) for ch in s)
+# ---------- utilitare ----------
 
 def norm(s: str) -> str:
-    s = strip_diacritics(str(s))
-    s = re.sub(r"[^0-9A-Za-z]+", "", s).lower()
-    return s
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.strip()
 
-def find_col(df: pd.DataFrame, candidates: list[str]) -> str:
-    cols = {norm(c): c for c in df.columns}
-    for c in candidates:
-        if norm(c) in cols:
-            return cols[norm(c)]
-    # fallback: încearcă „conține”
-    for c in candidates:
-        n = norm(c)
-        for k, orig in cols.items():
-            if n in k:
-                return orig
+def looks_like(col_name: str, candidates) -> bool:
+    cn = norm(col_name).lower().replace(" ", "")
+    return any(cn == norm(c).lower().replace(" ", "").replace(".", "") for c in candidates)
+
+def find_col(df: pd.DataFrame, candidates):
+    for c in df.columns:
+        if looks_like(c, candidates):
+            return c
     raise KeyError(f"Missing columns: tried {candidates} in {list(df.columns)}")
 
 def read_table(path: str) -> pd.DataFrame:
-    # sniff by extension, apoi fallback csv (latin-1) dacă e nevoie
-    low = path.lower()
+    if path.lower().endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+        return pd.read_excel(path, engine="openpyxl")
+    # fallback (uneori Gmail/Excel schimbă conten-type -> csv)
     try:
-        if low.endswith((".xlsx", ".xlsm", ".xls")):
-            return pd.read_excel(path, engine="openpyxl")
-        # csv
-        try:
-            return pd.read_csv(path)
-        except Exception:
-            return pd.read_csv(path, sep=None, engine="python")
+        return pd.read_csv(path, sep=None, engine="python")
     except Exception:
-        # uneori exportul e CSV cu diacritice -> latin-1
-        return pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
+        # ultima încercare – latin1
+        return pd.read_csv(path, sep=None, engine="python", encoding="latin1")
 
-def to_float(x):
-    if pd.isna(x):
-        return 0.0
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x).strip()
-    s = s.replace(".", "").replace(",", ".")  # 1.234,56 -> 1234.56
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
+RO_MONTHS = {
+    1:"IANUARIE",2:"FEBRUARIE",3:"MARTIE",4:"APRILIE",5:"MAI",6:"IUNIE",
+    7:"IULIE",8:"AUGUST",9:"SEPTEMBRIE",10:"OCTOMBRIE",11:"NOIEMBRIE",12:"DECEMBRIE"
+}
+def header_date_today() -> str:
+    today = date.today()
+    return f"{today.day} {RO_MONTHS[today.month]} {today.year}"
 
-def parse_date_time(date_val, time_val=None):
-    """Returnează datetime; dacă time_val e None, încearcă doar date_val."""
-    if pd.isna(date_val) and pd.isna(time_val):
+def to_datetime(d, t=None):
+    # acceptă deja d tip datetime, sau string „YYYY-MM-DD hh:mm:ss”
+    if pd.isna(d):
         return None
+    if isinstance(d, datetime):
+        return d
     try:
-        if time_val is None or str(time_val).strip() == "":
-            return pd.to_datetime(date_val)
-        # concatenează
-        return pd.to_datetime(
-            f"{pd.to_datetime(date_val).date()} {str(time_val).strip()}"
-        )
+        if t is not None and not pd.isna(t):
+            # combină Data + Ora
+            return datetime.strptime(f"{str(d)} {str(t)}", "%Y-%m-%d %H:%M:%S")
     except Exception:
-        # fallback strict
-        try:
-            return pd.to_datetime(date_val)
-        except Exception:
-            return None
+        pass
+    # încearcă parse liber
+    return pd.to_datetime(str(d), errors="coerce")
 
-# ------------------- completare șablon Excel -------------------
+def num(v):
+    if pd.isna(v):
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    # 46,16 -> 46.16
+    return float(str(v).replace(".", "").replace(",", "."))
+# ---------- stiluri openpyxl ----------
 
-def fill_top_info(ws, *, client_name, reg_nr, cui, address, colectari_str, header_date):
-    """Înlocuiește token-urile exact ca în șablonul din poză."""
-    mapping = {
-        "{NUME}": client_name or "",
-        "{NR. INREGISTRARE R.C.}": reg_nr or "",
-        "{CUI}": cui or "",
-        "{ADRESA}": address or "",
-        "{COLECTARI}": colectari_str or "",
-        "{HEADER_DATE}": header_date or "",
-        # alias opțional (în caz că mai există un șablon vechi)
-        "{NR_INREG}": reg_nr or "",
-    }
-    for row in ws.iter_rows():
-        for cell in row:
-            if isinstance(cell.value, str):
-                s = cell.value
-                changed = False
-                for k, v in mapping.items():
-                    if k in s:
-                        s = s.replace(k, v)
-                        changed = True
-                if changed:
-                    cell.value = s
+def copy_cell_style(dst, src):
+    dst.font = src.font
+    dst.border = src.border
+    dst.fill = src.fill
+    dst.number_format = src.number_format
+    dst.protection = src.protection
+    dst.alignment = src.alignment
 
-def write_transactions_table(ws, rows):
-    """
-    rows: listă de dicturi cu chei:
-      site, tid, produs, valoare (float), data (datetime)
-    Scrie de la rândul 17 inclusiv; rândul 16 rămâne antetul vizual.
-    """
-    rows = [r for r in rows if r.get("data") is not None]
-    rows.sort(key=lambda r: r["data"])
+def snapshot_row_styles(ws: Worksheet, row_idx: int):
+    styles = {}
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=row_idx, column=col)
+        styles[col] = {
+            "font": cell.font,
+            "border": cell.border,
+            "fill": cell.fill,
+            "numfmt": cell.number_format,
+            "protect": cell.protection,
+            "align": cell.alignment,
+        }
+    height = ws.row_dimensions[row_idx].height
+    return styles, height
 
-    START_ROW = 17
-    r = START_ROW
-    total = 0.0
+def apply_row_styles(ws: Worksheet, row_idx: int, styles, height):
+    for col, st in styles.items():
+        c = ws.cell(row=row_idx, column=col)
+        c.font = st["font"]
+        c.border = st["border"]
+        c.fill = st["fill"]
+        c.number_format = st["numfmt"]
+        c.protection = st["protect"]
+        c.alignment = st["align"]
+    if height is not None:
+        ws.row_dimensions[row_idx].height = height
 
-    for it in rows:
-        ws.cell(r, 1, it.get("site", ""))
-        ws.cell(r, 2, it.get("tid", ""))
-        ws.cell(r, 3, it.get("produs", ""))
+# ---------- generator ----------
 
-        c_val = ws.cell(r, 4, float(it.get("valoare", 0.0)))
-        c_val.number_format = '#,##0.00'
-
-        c_dt = ws.cell(r, 5, it["data"])
-        c_dt.number_format = 'yyyy-mm-dd hh:mm:ss'
-
-        total += float(it.get("valoare", 0.0))
-        r += 1
-
-    # rând goooal între listă și total (opțional)
-    # r += 1
-
-    total_row = r + 1
-    ws.cell(total_row, 1, "Total").font = Font(bold=True)
-    c_tot = ws.cell(total_row, 4, total)
-    c_tot.number_format = '#,##0.00'
-    c_tot.font = Font(bold=True)
-
-# --------------------------- generator --------------------------
-
-def build_orders(astob_path: str, key_path: str, template_path: str, out_dir: str):
+def run_generator(astob_path: str, key_path: str, template_path: str, out_dir: str, out_zip_path: str):
     os.makedirs(out_dir, exist_ok=True)
 
-    astob = read_table(astob_path)
+    ast = read_table(astob_path)
     key = read_table(key_path)
 
-    # ---- identificare coloane în KEY (tabel cheie) ----
+    # coloane ASTOB
+    col_date = find_col(ast, ["Data tranzacției", "Data tranzactiei", "data tranzactiei"])
+    col_time = next((c for c in ast.columns if looks_like(c, ["Ora tranzacției", "Ora tranzactiei"])), None)
+    col_value = find_col(ast, ["Sumă tranzacție", "Suma tranzactie", "sumă tranzacție"])
+    col_tid_ast = find_col(ast, ["Nr. terminal", "TID"])
+    col_site_ast = next((c for c in ast.columns if looks_like(c, ["Nr. site"])), None)
+    col_product_name = next((c for c in ast.columns if looks_like(c, ["Nume Comerciant"])), None)
+    if col_product_name is None:
+        # fallback – mapăm cod tip produs -> denumire produs din cheie, dacă există
+        col_code = find_col(ast, ["Cod tip produs"])
+        col_code_key = find_col(key, ["Cod tip produs"])
+        col_dn_key = find_col(key, ["DENUMIRE PRODUS"])
+        prod_map = dict(zip(key[col_code_key], key[col_dn_key]))
+        ast["__prod__"] = ast[col_code].map(prod_map).fillna("")
+        col_product_name = "__prod__"
+
+    # coloane CHEIE
+    col_tid_key = find_col(key, ["TID", "Nr. terminal"])
+    col_site_name = find_col(key, ["DENUMIRE SITE"])
     col_client = find_col(key, ["DENUMIRE SOCIETATEAGENT", "Denumire Societate Agent", "Client"])
-    col_tid_key = find_col(key, ["TID"])
-    # detalii client
-    col_reg = find_col(key, ["NR. INREGISTRARE R.C.", "Nr. inregistrare R.C.", "NR INREG", "Nr inregistrare RC"])
+    col_reg = find_col(key, ["Nr. inregistrare R.C.", "Nr. inregistrare R.C", "Nr. inregistrare RC", "NR. INREGISTRARE R.C."])
     col_cui = find_col(key, ["CUI"])
-    col_addr = find_col(key, ["ADRESA", "Adresa"])
+    col_addr = find_col(key, ["ADRESA", "Adresă", "Adresa"])
 
-    key_trim = key[[col_client, col_tid_key, col_reg, col_cui, col_addr]].copy()
-    key_trim.columns = ["client", "TID", "NR_INREG", "CUI", "ADRESA"]
-    # normalizări de tip
-    key_trim["TID"] = key_trim["TID"].astype(str).str.strip()
+    # pregătim frame unificat
+    df = ast.copy()
 
-    # ---- identificare coloane în ASTOB ----
-    col_tid_astob = find_col(astob, ["Nr. terminal", "TID", "Terminal ID", "Nr terminal", "Terminal"])
-    col_value = find_col(astob, ["Sumă tranzacție", "Suma tranzactie", "Valoare cu TVA", "Valoare"])
-    # „Nume Comerciant” este exact DENUMIREA PRODUSULUI în exemplul tău
-    col_prod = find_col(astob, ["Nume Comerciant", "Denumire Produs", "Denumire produs", "Produs"])
-    # site-ul pentru prima coloană
-    col_site = None
-    for cand in ["Denumire Site", "DENUMIRE SITE", "Nume Operator", "Site"]:
-        try:
-            col_site = find_col(astob, [cand])
-            break
-        except Exception:
-            pass
-    if not col_site:
-        # fallback: folosește numele clientului din key (după join), dacă lipsește coloana
-        col_site = None
+    df["__timestamp__"] = [to_datetime(d, ast.iloc[i][col_time] if col_time else None) for i, d in enumerate(ast[col_date])]
+    df["__amount__"] = ast[col_value].apply(num)
+    df["__tid__"] = ast[col_tid_ast].astype(str)
+    df["__site_id__"] = ast[col_site_ast].astype(str) if col_site_ast else ""
+    df["__prodname__"] = ast[col_product_name].astype(str)
 
-    # data + oră (pot fi una sau două coloane)
-    col_date = None
-    for cand in ["Data tranzacției", "Data tranzactiei", "Data"]:
-        try:
-            col_date = find_col(astob, [cand])
-            break
-        except Exception:
-            pass
-    col_time = None
-    if col_date:
-        for cand in ["Ora tranzacției", "Ora tranzactiei", "Ora", "Timp"]:
-            try:
-                col_time = find_col(astob, [cand])
-                break
-            except Exception:
-                pass
+    # join cu CHEIE după TID
+    k = key[[col_tid_key, col_site_name, col_client, col_reg, col_cui, col_addr]].copy()
+    k[col_tid_key] = k[col_tid_key].astype(str)
+    k.columns = ["__tid__", "__site__", "__client__", "__reg__", "__cui__", "__addr__"]
 
-    # subset astob
-    need_cols = [c for c in [col_tid_astob, col_value, col_prod, col_site, col_date, col_time] if c]
-    ast = astob[need_cols].copy()
-    ast.columns = [("TID" if c == col_tid_astob else
-                    "VALOARE" if c == col_value else
-                    "PRODUS" if c == col_prod else
-                    "SITE" if col_site and c == col_site else
-                    "DATA" if c == col_date else
-                    "ORA" if col_time and c == col_time else c) for c in ast.columns]
+    df = df.merge(k, on="__tid__", how="left")
 
-    # tipuri curate
-    ast["TID"] = ast["TID"].astype(str).str.strip()
-    ast["VALOARE"] = ast["VALOARE"].map(to_float)
+    # dacă lipsesc info de client (ex.: mai multe TID-uri pt același client), completăm cu ultima valoare non-nan la grupare
+    df["__client__"] = df["__client__"].fillna(method="ffill").fillna(method="bfill")
+    df["__site__"] = df["__site__"].fillna("")
 
-    # data+ora
-    if "ORA" in ast.columns:
-        ast["DT"] = [parse_date_time(d, t) for d, t in zip(ast["DATA"], ast["ORA"])]
-    else:
-        ast["DT"] = [parse_date_time(d) for d in ast["DATA"]]
+    # grupăm pe client
+    clients = []
+    for client, g in df.groupby("__client__"):
+        total = g["__amount__"].sum()
+        if total <= 0:
+            continue  # nu generăm pentru total 0
+        clients.append((client, g.copy(), total))
 
-    # join după TID
-    merged = pd.merge(ast, key_trim, on="TID", how="left")
+    if not clients:
+        raise ValueError("Nu există clienți cu total > 0 în acest lot.")
 
-    # dacă lipsește SITE în ASTOB, folosește numele clientului
-    if "SITE" not in merged.columns:
-        merged["SITE"] = merged["client"].fillna("")
+    # încarcă șablonul o singură dată ca să citim stilurile etalon
+    base_wb = load_workbook(template_path)
+    base_ws = base_wb.active
 
-    # grupează pe client
-    groups = []
-    for client_name, gdf in merged.groupby("client", dropna=True):
-        if pd.isna(client_name) or str(client_name).strip() == "":
-            # sari rândurile fără client potrivit
-            continue
-        rows = []
-        for _, row in gdf.iterrows():
-            rows.append({
-                "site": row.get("SITE", ""),
-                "tid": row.get("TID", ""),
-                "produs": row.get("PRODUS", ""),
-                "valoare": float(row.get("VALOARE", 0.0)),
-                "data": row.get("DT", None),
-            })
+    # memorăm locațiile cu tokenuri (le căutăm dinamic ca să nu depindem de coordonate fixe)
+    def find_token(ws, token):
+        token = "{" + token + "}"
+        for r in ws.iter_rows(values_only=False):
+            for c in r:
+                if isinstance(c.value, str) and token in c.value:
+                    return c.row, c.column
+        return None, None
 
-        # dacă nu avem tranzacții valide, sari
-        if not rows:
-            continue
+    row_hdr, col_hdr = find_token(base_ws, "HEADER_DATE")
+    row_col, col_col = find_token(base_ws, "COLECTARI")
+    row_total_tpl, _ = find_token(base_ws, "TOTAL")
+    row_first_tpl, _ = find_token(base_ws, "DENUMIRE SITE")
+    if not row_first_tpl:
+        row_first_tpl = 17  # fallback
 
-        # info client
-        groups.append({
-            "client": str(client_name),
-            "NR_INREG": str(row.get("NR_INREG", "")),
-            "CUI": str(row.get("CUI", "")),
-            "ADRESA": str(row.get("ADRESA", "")),
-            "rows": rows,
-        })
+    # snapshot stiluri pentru rândul de date și rândul de total
+    data_styles, data_height = snapshot_row_styles(base_ws, row_first_tpl)
+    total_styles, total_height = snapshot_row_styles(base_ws, row_total_tpl)
 
-    if not groups:
-        raise RuntimeError("Nu am găsit niciun client cu tranzacții potrivite (verifică TID în ambele fișiere).")
-
-    # data pentru colectări
-    all_dt = [r["data"] for g in groups for r in g["rows"] if r["data"] is not None]
-    if not all_dt:
-        raise RuntimeError("Nu am putut determina datele tranzacțiilor (coloana de dată/ora).")
-    dt_min = min(all_dt)
-    dt_max = max(all_dt)
-
-    colectari_str = f"Colectari - {dt_min:%d.%m.%Y} - {dt_max:%d.%m.%Y}"
-    header_date_str = format_header_date(datetime.now(timezone.utc).astimezone())
-
-    # creează fișierele Excel per client
-    out_files = []
-    for g in groups:
+    # pentru fiecare client: completăm și salvăm
+    for client, g, total in clients:
         wb = load_workbook(template_path)
         ws = wb.active
 
-        fill_top_info(
-            ws,
-            client_name=g["client"],
-            reg_nr=g["NR_INREG"],
-            cui=g["CUI"],
-            address=g["ADRESA"],
-            colectari_str=colectari_str,
-            header_date=header_date_str,
-        )
-        write_transactions_table(ws, g["rows"])
+        # antet: data de azi + colectari (min/max din g)
+        if row_hdr:
+            ws.cell(row=row_hdr, column=col_hdr).value = header_date_today()
+        if row_col:
+            start = g["__timestamp__"].min().date()
+            end = g["__timestamp__"].max().date()
+            ws.cell(row=row_col, column=col_col).value = f"Colectari - {start:%d.%m.%Y} - {end:%d.%m.%Y}"
 
-        safe_name = re.sub(r"[^\w\s\-\(\)\._]", "_", g["client"]).strip()
-        if not safe_name:
-            safe_name = "CLIENT"
-        fname = f"Ordin - {safe_name}.xlsx"
-        fpath = os.path.join(out_dir, fname)
-        wb.save(fpath)
-        out_files.append(fpath)
+        # date client (din primul rând cu info completă)
+        r0 = g.iloc[0]
+        # înlocuim toate tokenurile dacă apar oriunde în foaie
+        replace_map = {
+            "{NUME}": str(r0["__client__"] or ""),
+            "{NR. INREGISTRARE R.C.}": str(r0["__reg__"] or ""),
+            "{CUI}": str(r0["__cui__"] or ""),
+            "{ADRESA}": str(r0["__addr__"] or ""),
+        }
+        for r in ws.iter_rows(values_only=False):
+            for c in r:
+                if isinstance(c.value, str):
+                    v = c.value
+                    for ktoken, rep in replace_map.items():
+                        if ktoken in v:
+                            v = v.replace(ktoken, rep)
+                    c.value = v
 
-    return out_files
+        # sortare pe dată+oră
+        g = g.sort_values("__timestamp__", kind="mergesort")
 
-def zip_files(files: list[str], out_zip: str):
-    with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for p in files:
-            zf.write(p, arcname=os.path.basename(p))
+        # scriem rândurile
+        start_row = row_first_tpl
+        # primul rând: suprascrie rândul model
+        if not g.empty:
+            row = start_row
+            ws.cell(row=row, column=1, value=str(g.iloc[0]["__site__"] or ""))
+            ws.cell(row=row, column=2, value=str(g.iloc[0]["__tid__"]))
+            ws.cell(row=row, column=3, value=str(g.iloc[0]["__prodname__"]))
+            c_amt = ws.cell(row=row, column=4, value=float(g.iloc[0]["__amount__"]))
+            c_amt.number_format = "#,##0.00"
+            c_dt = ws.cell(row=row, column=5, value=g.iloc[0]["__timestamp__"])
+            c_dt.number_format = "yyyy-mm-dd hh:mm:ss"
+            # păstrăm formatările model
+            apply_row_styles(ws, row, data_styles, data_height)
 
-# ----------------------------- main -----------------------------
+        # restul rândurilor – inserăm sub model și copiem stilurile
+        for i in range(1, len(g)):
+            row = start_row + i
+            ws.insert_rows(row)
+            apply_row_styles(ws, row, data_styles, data_height)
+            ws.cell(row=row, column=1, value=str(g.iloc[i]["__site__"] or ""))
+            ws.cell(row=row, column=2, value=str(g.iloc[i]["__tid__"]))
+            ws.cell(row=row, column=3, value=str(g.iloc[i]["__prodname__"]))
+            c_amt = ws.cell(row=row, column=4, value=float(g.iloc[i]["__amount__"]))
+            c_amt.number_format = "#,##0.00"
+            c_dt = ws.cell(row=row, column=5, value=g.iloc[i]["__timestamp__"])
+            c_dt.number_format = "yyyy-mm-dd hh:mm:ss"
+
+        # rândul TOTAL – poziția lui inițială se mută odată cu inserările
+        total_row = row_total_tpl + max(0, len(g) - 1)
+        # ne asigurăm că scriem eticheta și suma, cu stilul din șablon
+        apply_row_styles(ws, total_row, total_styles, total_height)
+        ws.cell(row=total_row, column=1, value="Total")
+        c_tot = ws.cell(row=total_row, column=4, value=float(total))
+        c_tot.number_format = "#,##0.00"
+
+        # denumire fișier – CLIENT în nume
+        safe_client = re.sub(r'[\\/*?:"<>|]', "_", str(r0["__client__"] or "CLIENT"))
+        out_xlsx = os.path.join(out_dir, f"Ordin - {safe_client}.xlsx")
+        wb.save(out_xlsx)
+
+    # facem ZIP
+    with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fn in sorted(os.listdir(out_dir)):
+            if fn.lower().endswith(".xlsx"):
+                zf.write(os.path.join(out_dir, fn), arcname=fn)
+
+    return True
+
+
+# ---------- CLI ----------
 
 def main():
-    ap = argparse.ArgumentParser(description="Generează ordine de plată ASTOB pe baza șablonului.")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--astob", required=True)
     ap.add_argument("--key", required=True)
-    ap.add_argument("--template", required=True, help="Ex: static/bp model cu {} - date.xlsx")
+    ap.add_argument("--template", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--out-zip", required=True)
     args = ap.parse_args()
 
-    files = build_orders(args.astob, args.key, args.template, args.out_dir)
-    zip_files(files, args.out_zip)
+    ok = run_generator(args.astob, args.key, args.template, args.out_dir, args.out_zip)
+    print("ok" if ok else "fail")
+
 
 if __name__ == "__main__":
     main()
