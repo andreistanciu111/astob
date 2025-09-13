@@ -2,10 +2,17 @@
 # -*- coding: utf-8 -*-
 import argparse, re, zipfile, unicodedata
 from pathlib import Path
-from datetime import timedelta
+from datetime import timedelta, datetime
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font
+
+# ===== timezone RO pentru data antetului (azi)
+try:
+    from zoneinfo import ZoneInfo
+    TZ_RO = ZoneInfo("Europe/Bucharest")
+except Exception:
+    TZ_RO = None
 
 # =============== Utilitare ===============
 def norm(s):
@@ -79,7 +86,6 @@ def copy_style(src, dst):
         except Exception: pass
 
 def replace_total(ws, total_value):
-    """Doar {TOTAL} -> sumă; pune 'Total' în col. A pe același rând (Calibri 14 Bold)."""
     pat = re.compile(r"\{\s*total\s*\}", re.I)
     num_txt = f"{total_value:,.2f}".replace(",", "")
     for r in range(1, ws.max_row + 1):
@@ -109,7 +115,6 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 # ======= detectăm STRICT rândul-model (cu {token-uri}) =======
-TOKENS_TABLE = ["denumire site","tid","denumire produs","valoare cu tva","data tranzactiei"]
 TOKEN_PAT = {
     "denumire site":   re.compile(r"\{\s*denumire\s*site\s*\}", re.I),
     "tid":             re.compile(r"\{\s*tid\s*\}", re.I),
@@ -207,7 +212,7 @@ def main():
         dt = d
     astob2["DT_SORT"] = dt
 
-    # Pentru afișare:
+    # Pentru afișare în șablon:
     def fmt_dt(row):
         if pd.notna(row["DT_SORT"]):
             return row["DT_SORT"].strftime("%Y-%m-%d %H:%M:%S")
@@ -292,7 +297,7 @@ def main():
             "NUME": client_str, "CLIENT": client_str,
             "CUI": first_notna(g.get("CUI",""), ""),
             "ADRESA": first_notna(g.get("ADRESA",""), ""),
-            # Nr. Inregistrare / RC / RV
+            # Nr. Inregistrare / RC / RV (acoperim multiple forme)
             "NR. INREGISTRARE": first_notna(g.get("NR_RC",""), ""),
             "NR INREGISTRARE":  first_notna(g.get("NR_RC",""), ""),
             "NR. INREGISTRARE R.C.": first_notna(g.get("NR_RC",""), ""),
@@ -311,7 +316,8 @@ def main():
         dmin_dt = g["DT_SORT"].min()
         dmax_dt = g["DT_SORT"].max()
         colectari_str = f"Colectari - {dmin_dt:%d.%m.%Y} - {dmax_dt:%d.%m.%Y}"
-        header_date = dmax_dt.date() + timedelta(days=1)    # ziua următoare după ultima tranzacție
+        # ANTET = DATA ZILEI CÂND RULEAZĂ (RO time dacă e disponibil)
+        header_date = (datetime.now(TZ_RO).date() if TZ_RO else datetime.utcnow().date())
         header_str  = ro_month_upper(header_date)
         replace_placeholders(ws, {
             "{COLECTARI}": colectari_str,
