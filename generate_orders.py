@@ -1,459 +1,269 @@
-# generate_orders.py
-# ============================================================
-# Citire ASTOB + TABEL CHEIE, completare șablon Excel și
-# generare ZIP cu ordinele de plată.
-# Păstrează layout-ul din șablon și formatează sumele cu 2 zecimale.
-# ============================================================
-
 from __future__ import annotations
-import argparse
-import io
-import os
-import zipfile
-from datetime import datetime
-from typing import Optional, Tuple
+import zipfile, re
+from io import BytesIO
+from datetime import datetime, date
+from typing import Dict, List, Tuple
+from copy import copy
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+from unidecode import unidecode
 from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
 
-# ---------------- Utils de citire ----------------
+# ---------------- utils ----------------
+RO_MONTHS = {1:"IANUARIE",2:"FEBRUARIE",3:"MARTIE",4:"APRILIE",5:"MAI",6:"IUNIE",7:"IULIE",8:"AUGUST",9:"SEPTEMBRIE",10:"OCTOMBRIE",11:"NOIEMBRIE",12:"DECEMBRIE"}
 
-def _sniff_read(path: str) -> pd.DataFrame:
-    """
-    Citește atât .xlsx cât și .csv (cu separatori & encodări frecvente).
-    """
-    name = os.path.basename(path).lower()
-    # Excel direct
-    if name.endswith(".xlsx") or name.endswith(".xlsm") or name.endswith(".xls"):
-        return pd.read_excel(path, engine="openpyxl")
-    # CSV – încercări tolerate
-    for enc in ("utf-8-sig", "cp1250", "cp1252", "latin-1"):
-        try:
-            return pd.read_csv(path, sep=None, engine="python", encoding=enc)
-        except Exception:
-            continue
-    # Ultima șansă: delimitor comun
-    return pd.read_csv(path, sep=";", engine="python", encoding_errors="ignore")
+def today_ro(d: date | None = None) -> str:
+    d = d or date.today()
+    return f"{d.day} {RO_MONTHS[d.month]} {d.year}"
 
+def today_ro_bucharest() -> str:
+    # data curentă în Europe/Bucharest
+    now = datetime.now(ZoneInfo("Europe/Bucharest")).date()
+    return today_ro(now)
 
-def read_table(path: str) -> pd.DataFrame:
-    df = _sniff_read(path)
-    # normalizează header-ele: fără spații duble, strip
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+def norm(s: str) -> str:
+    s = unidecode(str(s)).lower().replace("\u00A0"," ")
+    s = re.sub(r"[^a-z0-9 ]+"," ", s)
+    return re.sub(r"\s+"," ", s).strip()
 
-
-# ---------------- Normalizări coloane ----------------
-
-def _norm(s: str) -> str:
-    return (
-        s.lower()
-        .replace("ă", "a").replace("â", "a").replace("ș", "s").replace("ţ", "t").replace("ț", "t").replace("î", "i")
-        .replace(".", " ").replace("_", " ").replace("-", " ").replace("  ", " ").strip()
-    )
-
-
-def find_col(df: pd.DataFrame, candidates: list[str]) -> str:
-    """
-    Găsește prima coloană existentă în DataFrame, tolerantă la diacritice/spații/punctuație.
-    """
-    norms = {_norm(c): c for c in df.columns}
-    for cand in candidates:
-        nc = _norm(cand)
-        if nc in norms:
-            return norms[nc]
-    # fallback: conține
-    for cand in candidates:
-        nc = _norm(cand)
-        for k, v in norms.items():
-            if nc in k:
-                return v
+def find_col(df: pd.DataFrame, candidates: List[str]) -> str:
+    cmap = {norm(c): c for c in df.columns}
+    vars_ = [norm(c) for c in candidates]
+    for v in vars_:
+        if v in cmap: return cmap[v]
+    for v in vars_:
+        hits = [orig for k,orig in cmap.items() if v in k]
+        if len(hits)==1: return hits[0]
     raise KeyError(f"Missing columns: tried {candidates} in {list(df.columns)}")
 
-
-# ---------------- Conversii & formate ----------------
-
-def parse_amount(v) -> float:
-    """
-    Transformă valori românești '1.234,56' / '46,16' / '46' în float.
-    """
-    if pd.isna(v):
-        return 0.0
-    s = str(v).strip()
-    # dacă e deja numeric
+def read_table_from_bytes(data: bytes) -> pd.DataFrame:
     try:
-        return float(s)
+        return pd.read_excel(BytesIO(data), engine="openpyxl")
     except Exception:
         pass
-    # curățare românească
-    s = s.replace(" ", "")
-    if "," in s and "." in s:
-        # probabil mii cu punct și zecimale cu virgulă
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s:
-        s = s.replace(",", ".")
-    # altfel rămâne așa
+    for enc in ("utf-8","cp1250","cp1252","latin-1"):
+        try:
+            return pd.read_csv(BytesIO(data), sep=None, engine="python", encoding=enc)
+        except Exception:
+            continue
+    return pd.read_csv(BytesIO(data), engine="python")
+
+def to_float(x) -> float:
+    if pd.isna(x): return 0.0
+    if isinstance(x,(int,float)): return float(x)
+    s = str(x).strip()
+    if s.count(",")==1: s = s.replace(".","").replace(",",".")
+    else: s = s.replace(",",".")
+    try: return float(s)
+    except: return 0.0
+
+def combine_dt(dv, tv) -> datetime | None:
+    if pd.isna(dv): return None
     try:
-        return float(s)
-    except Exception:
-        return 0.0
+        d = pd.to_datetime(str(dv), dayfirst=True)
+    except: return None
+    if tv is not None and not pd.isna(tv) and str(tv).strip():
+        try:
+            t = pd.to_datetime(str(tv)).time()
+            return datetime.combine(d.date(), t)
+        except: return d.to_pydatetime()
+    return d.to_pydatetime()
 
+def safe_name(s: str) -> str:
+    s = re.sub(r'[\\/:*?"<>|]', "_", str(s))
+    return re.sub(r"\s+"," ", s).strip()
 
-def parse_datetime(date_str, time_str: Optional[str]) -> datetime:
-    """
-    Din 'Data tranzacției' + 'Ora tranzacției' returnează datetime (inclusiv ora).
-    Dacă data conține deja ora, ignoră time_str.
-    """
-    if pd.isna(date_str):
-        return datetime.min
-
-    # Dacă data e deja datetime
-    if isinstance(date_str, datetime):
-        base = date_str
-    else:
-        s = str(date_str).strip()
-        # încearcă formatele comune
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d.%m.%Y %H:%M:%S", "%d.%m.%Y", "%Y/%m/%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
-            try:
-                base = datetime.strptime(s, fmt)
-                break
-            except Exception:
-                base = None
-        if base is None:
-            # încearcă pandas
-            try:
-                base = pd.to_datetime(s, dayfirst=True, errors="coerce")
-                if pd.isna(base):
-                    return datetime.min
-                base = pd.Timestamp(base).to_pydatetime()
-            except Exception:
-                return datetime.min
-
-    # Dacă data NU are ora și avem coloană separată pentru oră
-    if time_str and not (base.hour or base.minute or base.second):
-        ts = str(time_str).strip()
-        for tfmt in ("%H:%M:%S", "%H:%M"):
-            try:
-                t = datetime.strptime(ts, tfmt)
-                base = base.replace(hour=t.hour, minute=t.minute, second=t.second)
-                break
-            except Exception:
-                pass
-
-    return base
-
-
-def ro_month_upper(dt: datetime) -> str:
-    months = {
-        1: "IANUARIE", 2: "FEBRUARIE", 3: "MARTIE", 4: "APRILIE",
-        5: "MAI", 6: "IUNIE", 7: "IULIE", 8: "AUGUST",
-        9: "SEPTEMBRIE", 10: "OCTOMBRIE", 11: "NOIEMBRIE", 12: "DECEMBRIE",
-    }
-    return f"{dt.day} {months.get(dt.month, '').upper()} {dt.year}"
-
-
-# ---------------- Helpers pentru șablon ----------------
-
-def find_cell(ws: Worksheet, needle: str) -> Optional[Tuple[int, int]]:
-    """Caută exact textul într-o celulă și întoarce (row, col) 1-based."""
-    for r in ws.iter_rows(values_only=False):
-        for c in r:
-            if isinstance(c.value, str) and c.value.strip() == needle:
-                return c.row, c.column
+def first_cell(ws, needle: str):
+    for row in ws.iter_rows():
+        for c in row:
+            if isinstance(c.value,str) and needle in c.value:
+                return c
     return None
 
+def snapshot_row(ws, row_idx: int):
+    styles = {}; height = ws.row_dimensions[row_idx].height
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=row_idx, column=col)
+        styles[col] = {
+            "font":    copy(cell.font),
+            "border":  copy(cell.border),
+            "fill":    copy(cell.fill),
+            "numfmt":  cell.number_format,
+            "protect": copy(cell.protection),
+            "align":   copy(cell.alignment),
+        }
+    return styles, height
 
-def replace_placeholder(ws: Worksheet, placeholder: str, value: str):
-    """Înlocuiește placeholder-ul oriunde apare într-o celulă de tip string."""
-    for r in ws.iter_rows(values_only=False):
-        for c in r:
-            if isinstance(c.value, str) and placeholder in c.value:
-                c.value = c.value.replace(placeholder, value)
+def apply_row(ws, row_idx: int, styles, height):
+    for col, st in styles.items():
+        c = ws.cell(row=row_idx, column=col)
+        c.font          = copy(st["font"])
+        c.border        = copy(st["border"])
+        c.fill          = copy(st["fill"])
+        c.number_format = st["numfmt"]
+        c.protection    = copy(st["protect"])
+        c.alignment     = copy(st["align"])
+    if height is not None:
+        ws.row_dimensions[row_idx].height = height
 
+def replace_all(ws, mapping: Dict[str,str]):
+    for row in ws.iter_rows():
+        for c in row:
+            if isinstance(c.value,str):
+                v = c.value; changed = False
+                for k,val in mapping.items():
+                    if k in v: v = v.replace(k, val); changed = True
+                if changed: c.value = v
 
-def set_col_width(ws: Worksheet, col_idx: int, width: float):
-    ws.column_dimensions[get_column_letter(col_idx)].width = width
+# -------------- core --------------
+def generate_zip_from_bytes(astob_bytes: bytes, key_bytes: bytes, template_path: str) -> bytes:
+    # citește tabele tolerant
+    ast = read_table_from_bytes(astob_bytes)
+    key = read_table_from_bytes(key_bytes)
 
-
-# ---------------- Generator per client ----------------
-
-def fill_workbook_for_client(
-    template_path: str,
-    client_name: str,
-    client_rc: str,
-    client_cui: str,
-    client_addr: str,
-    tx_rows: list[dict],
-    colectari_text: str,
-    header_date_text: str,
-    out_path: str,
-):
-    """
-    Copiază șablonul și scrie datele pentru un client.
-    tx_rows: listă de dict-uri cu chei: site, tid, produs, valoare (float), data (datetime)
-    """
-    wb = load_workbook(template_path)
-    ws = wb.active  # presupunem un singur sheet: „Foaie1”
-
-    # 1) antet
-    replace_placeholder(ws, "{NUME}", str(client_name) if client_name else "")
-    replace_placeholder(ws, "{NR. INREGISTRARE R.C.}", str(client_rc) if client_rc else "")
-    replace_placeholder(ws, "{CUI}", str(client_cui) if client_cui else "")
-    replace_placeholder(ws, "{ADRESA}", str(client_addr) if client_addr else "")
-    replace_placeholder(ws, "{HEADER_DATE}", header_date_text)
-    replace_placeholder(ws, "{COLECTARI}", colectari_text)
-
-    # 2) header de tabel (scriem textele vizibile peste placeholders)
-    replace_placeholder(ws, "{DENUMIRE SITE}", "Denumire Site")
-    replace_placeholder(ws, "{TID}", "TID")
-    replace_placeholder(ws, "{DENUMIRE PRODUS}", "Denumire Produs")
-    replace_placeholder(ws, "{VALOARE CU TVA}", "Valoare cu TVA")
-    replace_placeholder(ws, "{DATA TRANZACTIEI}", "Data Tranzactiei")
-    replace_placeholder(ws, "{TOTAL}", "Total")
-
-    # Găsim rândul de start = rândul cu unul din headerele de mai sus (luăm cel pentru „Denumire Site”)
-    start_pos = find_cell(ws, "Denumire Site")
-    if not start_pos:
-        # fallback: încearcă după placeholder-ul original dacă a rămas
-        start_pos = find_cell(ws, "{DENUMIRE SITE}")
-    if not start_pos:
-        # hard fallback: 17, conform șabloanelor tale
-        start_row = 17
-        start_col = 1
-    else:
-        start_row, start_col = start_pos
-
-    # Datele încep pe rândul următor
-    row = start_row + 1
-
-    # 3) scriem tranzacțiile
-    total = 0.0
-    for tx in tx_rows:
-        site = tx.get("site", "")
-        tid = tx.get("tid", "")
-        prod = tx.get("produs", "")
-        val = float(tx.get("valoare", 0.0))
-        dt  = tx.get("data")  # datetime
-
-        ws.cell(row=row, column=start_col + 0, value=site)
-        ws.cell(row=row, column=start_col + 1, value=str(tid))
-        ws.cell(row=row, column=start_col + 2, value=prod)
-
-        c_val = ws.cell(row=row, column=start_col + 3, value=val)
-        c_val.number_format = "0.00"          # <<<<<< 2 zecimale, nu „000”
-        total += val
-
-        # data tranzacției: „YYYY-MM-DD HH:MM:SS”
-        if isinstance(dt, datetime) and dt != datetime.min:
-            ws.cell(row=row, column=start_col + 4, value=dt.strftime("%Y-%m-%d %H:%M:%S"))
-        else:
-            ws.cell(row=row, column=start_col + 4, value="")
-
-        row += 1
-
-    # 4) total sub ultimele tranzacții
-    # găsim celula cu „Total” (am înlocuit placeholderul mai sus)
-    total_label_pos = find_cell(ws, "Total")
-    if total_label_pos:
-        trow, tcol = total_label_pos
-        # punem totalul în aceeași coloană ca valorile (start_col + 3)
-        total_cell = ws.cell(row=trow, column=start_col + 3, value=total)
-        total_cell.number_format = "0.00"     # <<<<<< 2 zecimale
-
-    # Ajustări utile (optional): lățimi consistente ca să nu mai sară textul
+    # ASTOB
+    col_tid_ast  = find_col(ast, ["Nr. terminal","TID"])
+    col_sum_ast  = find_col(ast, ["Sumă tranzacție","Suma tranzactie","Valoare cu TVA"])
+    # denumire produs = prefer Nume Operator (cerința ta)
+    col_prod_ast = find_col(ast, ["Nume Operator","Nume operator","Operator","Denumire Produs","Nume Comerciant","Comerciant"])
+    col_date_ast = find_col(ast, ["Data tranzacției","Data tranzactiei","Data"])
     try:
-        set_col_width(ws, start_col + 0, 26.0)  # Denumire Site
-        set_col_width(ws, start_col + 1, 14.0)  # TID
-        set_col_width(ws, start_col + 2, 34.0)  # Denumire Produs
-        set_col_width(ws, start_col + 3, 14.0)  # Valoare
-        set_col_width(ws, start_col + 4, 22.0)  # Data
-    except Exception:
-        pass
-
-    # 5) salvează fișierul
-    wb.save(out_path)
-
-
-# ---------------- Orchestrator ----------------
-
-def run_generator(astob_path: str, key_path: str, template_path: str, out_dir: str, out_zip_path: str) -> bool:
-    ast = read_table(astob_path)
-    key = read_table(key_path)
-
-    # Coloane cheie în ASTOB
-    col_site_ast   = find_col(ast, ["Nr. site", "Denumire Site", "Site"])
-    col_tid_ast    = find_col(ast, ["Nr. terminal", "TID"])
-    col_prod_ast   = find_col(ast, ["Nume Operator", "Denumire Produs"])
-    col_sum_ast    = find_col(ast, ["Sumă tranzacție", "Suma tranzactie", "Valoare cu TVA", "Valoare"])
-    col_date_ast   = find_col(ast, ["Data tranzacției", "Data tranzactiei", "Data"])
-    # oră poate lipsi – nu o fac obligatorie
-    try:
-        col_time_ast = find_col(ast, ["Ora tranzacției", "Ora tranzactiei", "Ora"])
-    except Exception:
+        col_time_ast = find_col(ast, ["Ora tranzacției","Ora tranzactiei","Ora"])
+    except:
         col_time_ast = None
 
-    # Coloane cheie în TABEL CHEIE
-    col_client_key = find_col(key, ["DENUMIRE SOCIETATEAGENT", "Denumire societate agent", "Denumire societateagent", "NUME", "CLIENT"])
-    col_tid_key    = find_col(key, ["TID", "Nr. terminal"])
-    col_cui_key    = find_col(key, ["CUI CNP", "CUI"])
-    col_reg_key    = find_col(key, ["NR INREGISTRARE", "Nr. inregistrare R.C."])
-    col_addr_key   = find_col(key, ["ADRESA", "Adresa"])
+    # KEY (site = BMC)
+    col_tid_key  = find_col(key, ["TID","Nr. terminal"])
+    col_name_key = find_col(key, ["DENUMIRE SOCIETATEAGENT","Denumire Societate Agent","NUME","Client"])
+    col_rc_key   = find_col(key, ["NR INREGISTRARE","Nr. inregistrare R.C.","NR. INREGISTRARE R.C.","Nr inregistrare RC","NR INREG"])
+    col_cui_key  = find_col(key, ["CUI","CUI CNP","CNP"])
+    col_addr_key = find_col(key, ["ADRESA","Sediul central","Adresă"])
+    col_site_key = find_col(key, ["BMC","DENUMIRE SITE","Denumire Site","Site","Punct de lucru","Locatie"])
 
-    # normalizăm tipurile
-    key["_TID"]    = key[col_tid_key].astype(str).str.strip()
-    key["_NUME"]   = key[col_client_key].astype(str).str.strip()
-    key["_CUI"]    = key[col_cui_key].astype(str).str.strip()
-    key["_REG"]    = key[col_reg_key].astype(str).str.strip()
-    key["_ADRESA"] = key[col_addr_key].astype(str).str.strip()
-
-    # map TID -> (nume, cui, reg, adresa, site)
-    # „Denumire Site” în Key poate fi absentă; dacă există, o folosim ca SITE.
-    site_col_key: Optional[str]
-    try:
-        site_col_key = find_col(key, ["DENUMIRE SITE", "Denumire Site", "Site"])
-        key["_SITE"] = key[site_col_key].astype(str).str.strip()
-    except Exception:
-        site_col_key = None
-        key["_SITE"] = ""
-
-    key_map = {}
-    for _, r in key.iterrows():
-        tid = str(r["_TID"])
-        key_map[tid] = {
-            "nume":   r["_NUME"],
-            "cui":    r["_CUI"],
-            "reg":    r["_REG"],
-            "adresa": r["_ADRESA"],
-            "site":   r.get("_SITE", ""),
-        }
-
-    # Grupăm tranzacțiile din ASTOB pe client (prin TID -> Client din key)
-    rows = []
-    for _, tr in ast.iterrows():
-        tid = str(tr[col_tid_ast]).strip()
-        km  = key_map.get(tid)
-        if not km:
-            # TID necunoscut în tabelul cheie → sare peste
-            continue
-
-        client = km["nume"]
-        # site din KEY, dacă nu există luăm din ASTOB (coloana „Nr. site” / „Denumire Site”)
-        site = km["site"] if km["site"] else str(tr.get(col_site_ast, "")).strip()
-        produs = str(tr.get(col_prod_ast, "")).strip()
-
-        val = parse_amount(tr.get(col_sum_ast, 0))
-        dt  = parse_datetime(tr.get(col_date_ast, ""), tr.get(col_time_ast) if col_time_ast else None)
-
-        rows.append({
-            "client": client,
-            "tid": tid,
-            "site": site,
-            "produs": produs,
-            "valoare": val,
-            "data": dt,
-            "cui": km["cui"],
-            "reg": km["reg"],
-            "adresa": km["adresa"],
-        })
-
-    if not rows:
-        # nimic de generat
-        with zipfile.ZipFile(out_zip_path, "w", zipfile.ZIP_DEFLATED) as _z:
-            pass
-        return True
-
-    # Sortăm global după client, apoi dată (cu oră)
-    rows.sort(key=lambda r: (r["client"], r["data"]))
-
-    # Data pentru antet = data de azi
-    header_date_text = ro_month_upper(datetime.now())
-
-    # Interval „Colectări” = min(data) – max(data) din ASTOB
-    dts = [r["data"] for r in rows if isinstance(r["data"], datetime) and r["data"] != datetime.min]
-    if dts:
-        dmin = min(dts).strftime("%d.%m.%Y")
-        dmax = max(dts).strftime("%d.%m.%Y")
-        colectari_text = f"{dmin} - {dmax}"
+    # normalize
+    ast["_TID"]  = ast[col_tid_ast].astype(str).str.replace(r"\.0$","",regex=True).str.strip()
+    ast["_VAL"]  = ast[col_sum_ast].map(to_float)
+    ast["_PROD"] = ast[col_prod_ast].astype(str).str.strip()
+    if col_time_ast:
+        ast["_DT"] = [combine_dt(d, ast[col_time_ast].iloc[i]) for i,d in enumerate(ast[col_date_ast])]
     else:
-        colectari_text = ""
+        ast["_DT"] = [combine_dt(d, None) for d in ast[col_date_ast]]
+    ast = ast.dropna(subset=["_TID","_DT"])
 
-    # Creează out_dir
-    os.makedirs(out_dir, exist_ok=True)
+    key["_TID"]  = key[col_tid_key].astype(str).str.replace(r"\.0$","",regex=True).str.strip()
+    key["_NAME"] = key[col_name_key].astype(str).str.strip()
+    key["_RC"]   = key[col_rc_key].astype(str).str.strip()
+    key["_CUI"]  = key[col_cui_key].astype(str).str.strip()
+    key["_ADR"]  = key[col_addr_key].astype(str).str.strip()
+    key["_SITE"] = key[col_site_key].astype(str).str.strip()
 
-    # Iterează pe clienți
-    ok_any = False
-    from itertools import groupby
-    for client, grp in groupby(rows, key=lambda r: r["client"]):
-        grp_list = list(grp)
-        total = sum(r["valoare"] for r in grp_list)
-        # Sara peste client dacă TOTAL == 0
-        if abs(total) < 1e-9:
-            continue
+    # map TID -> info (site din cheie BMC)
+    tid2info = {
+        r["_TID"]: {"client": r["_NAME"], "rc": r["_RC"], "cui": r["_CUI"], "adr": r["_ADR"], "site": r["_SITE"]}
+        for _,r in key.iterrows()
+    }
 
-        # info din primul rând pentru antet
-        first = grp_list[0]
-        client_rc  = first["reg"]
-        client_cui = first["cui"]
-        client_addr= first["adresa"]
+    # păstrăm doar tranzacții cu TID recunoscut
+    ast = ast[ast["_TID"].isin(tid2info.keys())].copy()
+    if ast.empty:
+        raise RuntimeError("Nu s-au găsit TID-uri comune între ASTOB și TABEL CHEIE.")
 
-        # Triere tranzacții (data cu oră)
-        grp_list.sort(key=lambda r: r["data"])
+    # grupăm pe client
+    rows_by_client: Dict[str, List[Tuple[str,str,str,float,datetime]]] = {}
+    for _, r in ast.iterrows():
+        info = tid2info.get(r["_TID"])
+        if not info: continue
+        rows_by_client.setdefault(info["client"], []).append((
+            info["site"],           # DENUMIRE SITE din BMC
+            r["_TID"],
+            r["_PROD"],             # <- acum e Nume Operator prioritar
+            float(r["_VAL"] or 0.0),
+            r["_DT"],
+        ))
 
-        # Pregătește listă simplificată pentru scriere în template
-        tx_rows = []
-        for r in grp_list:
-            tx_rows.append({
-                "site": r["site"] if r["site"] else client,   # dacă lipsește site, punem numele clientului
-                "tid": r["tid"],
-                "produs": r["produs"],
-                "valoare": r["valoare"],
-                "data": r["data"],
+    # template
+    wb0 = load_workbook(template_path); ws0 = wb0.active
+    c_site = first_cell(ws0, "{DENUMIRE SITE}")
+    c_tid  = first_cell(ws0, "{TID}")
+    c_prod = first_cell(ws0, "{DENUMIRE PRODUS}")
+    c_val  = first_cell(ws0, "{VALOARE CU TVA}")
+    c_dat  = first_cell(ws0, "{DATA TRANZACTIEI}")
+    c_tot  = first_cell(ws0, "{TOTAL}")
+    if not all([c_site, c_tid, c_prod, c_val, c_dat, c_tot]):
+        raise RuntimeError("Nu găsesc placeholder-ele de tabel în șablon.")
+    row_model = c_site.row
+    data_styles, data_height   = snapshot_row(ws0, row_model)
+    total_styles, total_height = snapshot_row(ws0, c_tot.row)
+
+    out_zip = BytesIO()
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for client, items in rows_by_client.items():
+            items = [t for t in items if t[3] > 0.0]
+            if not items: continue
+            items.sort(key=lambda x: x[4])
+
+            total_client = round(sum(v for *_, v, _ in items), 2)
+            if total_client <= 0.0: continue
+
+            dmin = min(dt.date() for *_, dt in items)
+            dmax = max(dt.date() for *_, dt in items)
+            colectari = f"Colectari - {dmin:%d.%m.%Y} - {dmax:%d.%m.%Y}"
+
+            any_tid = items[0][1]
+            info = tid2info.get(any_tid, {"rc":"","cui":"","adr":""})
+
+            wb = load_workbook(template_path); ws = wb.active
+
+            replace_all(ws, {
+                "{HEADER_DATE}": today_ro_bucharest(),  # <- data de azi în RO
+                "{COLECTARI}": colectari,
+                "{NUME}": client,
+                "{NR. INREGISTRARE R.C.}": info.get("rc",""),
+                "{CUI}": info.get("cui",""),
+                "{ADRESA}": info.get("adr",""),
+                "{DENUMIRE SITE}": "Denumire Site",
+                "{TID}": "TID",
+                "{DENUMIRE PRODUS}": "Denumire Produs",
+                "{VALOARE CU TVA}": "Valoare cu TVA",
+                "{DATA TRANZACTIEI}": "Data Tranzactiei",
+                "{TOTAL}": "Total",
             })
 
-        # nume fișier
-        safe_client = "".join(ch for ch in str(client) if ch.isalnum() or ch in (" ", "-", "_")).strip()
-        out_xlsx = os.path.join(out_dir, f"Ordin - {safe_client}.xlsx")
+            # scriere rânduri cu stilul rândului-model
+            r = row_model
+            for idx, (site, tid, prod, val, dt) in enumerate(items):
+                if idx > 0: ws.insert_rows(r)
+                apply_row(ws, r, data_styles, data_height)
 
-        fill_workbook_for_client(
-            template_path=template_path,
-            client_name=client,
-            client_rc=client_rc,
-            client_cui=client_cui,
-            client_addr=client_addr,
-            tx_rows=tx_rows,
-            colectari_text=colectari_text,
-            header_date_text=header_date_text,
-            out_path=out_xlsx,
-        )
-        ok_any = True
+                ws.cell(r, c_site.column, value=site)
+                ws.cell(r, c_tid.column,  value=tid)
+                ws.cell(r, c_prod.column, value=prod)
 
-    # Ambalează zip
-    with zipfile.ZipFile(out_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fn in os.listdir(out_dir):
-            full = os.path.join(out_dir, fn)
-            if os.path.isfile(full):
-                zf.write(full, arcname=fn)
+                # valoare numerică, fără zero-padding
+                vcell = ws.cell(r, c_val.column, value=None)
+                vcell.number_format = "General"      # curăță orice format moștenit
+                vcell.value = round(float(val), 2)   # numeric
+                vcell.number_format = "#,##0.00"     # FIX: 2 zecimale; Excel afișează 46,00 în RO
+                vcell.alignment = Alignment(horizontal="right", vertical="center")
 
-    return ok_any
+                dcell = ws.cell(r, c_dat.column, value=dt)
+                dcell.number_format = "yyyy-mm-dd hh:mm:ss"
 
+                r += 1
 
-# ---------------- CLI ----------------
+            # total – pe rândul placeholder {TOTAL} mutat după inserări
+            tot_row = c_tot.row + (len(items)-1)
+            apply_row(ws, tot_row, total_styles, total_height)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--astob", required=True)
-    ap.add_argument("--key", required=True)
-    ap.add_argument("--template", required=True)
-    ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--out-zip", required=True)
-    args = ap.parse_args()
+            tcell = ws.cell(tot_row, c_tot.column, value=None)
+            tcell.number_format = "General"
+            tcell.value = round(float(total_client), 2)
+            tcell.number_format = "#,##0.00"        # FIX idem, total cu 2 zecimale
+            tcell.alignment = Alignment(horizontal="right", vertical="center")
 
-    ok = run_generator(args.astob, args.key, args.template, args.out_dir, args.out_zip)
-    if not ok:
-        raise SystemExit(1)
+            bio = BytesIO(); wb.save(bio); bio.seek(0)
+            zf.writestr(f"Ordin - {safe_name(client)}.xlsx", bio.read())
 
-
-if __name__ == "__main__":
-    main()
+    out_zip.seek(0); return out_zip.read()
